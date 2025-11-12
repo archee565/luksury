@@ -1,3 +1,11 @@
+[profile.release]
+opt-level = "z"  # Optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"  # Reduces panic handling code
+strip = true    # Remove debug symbols
+
+
 [package]
 name = "luksury"
 version = "0.1.0"

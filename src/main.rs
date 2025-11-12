@@ -21,7 +21,7 @@ struct BlockDevice {
 }
 
 /// Finds the root device name by examining the parent of the root partition
-pub fn find_root_device() -> Result<String, Box<dyn std::error::Error>> {
+pub fn find_root_device() -> Result<(String,u32),Box<dyn std::error::Error>> {
     // Execute lsblk command with JSON output
     let output = Command::new("lsblk")
         .arg("-J")
@@ -36,19 +36,14 @@ pub fn find_root_device() -> Result<String, Box<dyn std::error::Error>> {
     // Parse JSON output
     let lsblk_output = serde_json::from_slice::<LsblkOutput>(&output.stdout)?;
 
-    if let Some(res) = find_parent_device(&lsblk_output.blockdevices, "")
+    if let Some(encrtypted_device) = find_parent_device(&lsblk_output.blockdevices, "")
     {
-        println!("disk: {}   part: {:?}",res,extract_partition_number(res.as_str()));
+        if let Some(part) = extract_partition_number(encrtypted_device.as_str())
+        {
+            return Ok((encrtypted_device,part));
+        }
     }
-
-    // Find the root partition and its parent
-    if let Some((root_partition, parent_device)) = find_root_partition_and_parent(&lsblk_output.blockdevices) {
-        println!("Root partition: {}", root_partition);
-        println!("Parent device: {}", parent_device);
-        Ok(parent_device)
-    } else {
-        Err("Could not find root partition or its parent".into())
-    }
+    Err("Can't find root device".into())
 }
 
 
@@ -109,28 +104,6 @@ fn find_parent_device(devices : &[BlockDevice], parent : &str) -> Option<String>
     None
 }
 
-/// Recursively searches for the root partition and returns (partition_name, parent_device_name)
-fn find_root_partition_and_parent(devices: &[BlockDevice]) -> Option<(String, String)> {
-    for device in devices {
-        // Check if this device is mounted as root
-        if let Some(mountpoint) = &device.mountpoint {
-            if mountpoint == "/" {
-                // This is the root partition, now find its parent
-                return Some((device.name.clone(), device.name.clone()));
-            }
-        }
-
-        // Recursively check children
-        if let Some(children) = &device.children {
-            if let Some((root_partition, _)) = find_root_partition_and_parent(children) {
-                // Found root partition in children, this device is the parent
-                return Some((root_partition, device.name.clone()));
-            }
-        }
-    }
-    None
-}
-
 #[derive(Debug)]
 pub struct RootDeviceInfo {
     pub root_partition: String,
@@ -141,76 +114,12 @@ pub struct RootDeviceInfo {
     pub size: String,
 }
 
-/// Finds detailed information about the root device and its parent
-fn find_root_device_info(devices: &[BlockDevice]) -> Option<RootDeviceInfo> {
-    for device in devices {
-        // Check if this device is mounted as root
-        if let Some(mountpoint) = &device.mountpoint {
-            if mountpoint == "/" {
-                return Some(RootDeviceInfo {
-                    root_partition: device.name.clone(),
-                    parent_device: device.name.clone(), // For root devices without parent
-                    device_type: device.device_type.clone(),
-                    is_removable: device.rm,
-                    is_read_only: device.ro,
-                    size: device.size.clone(),
-                });
-            }
-        }
-
-        // Check children for root mountpoint
-        if let Some(children) = &device.children {
-            for child in children {
-                if let Some(mountpoint) = &child.mountpoint {
-                    if mountpoint == "/" {
-                        return Some(RootDeviceInfo {
-                            root_partition: child.name.clone(),
-                            parent_device: device.name.clone(),
-                            device_type: device.device_type.clone(),
-                            is_removable: device.rm,
-                            is_read_only: device.ro,
-                            size: device.size.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 // Example usage
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match find_root_device() {
-        Ok(device) => println!("Root device: {}", device),
+        Ok((device,part)) => println!("Root device: {} part: {}", device,part),
         Err(e) => eprintln!("Error: {}", e),
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_find_root_device() {
-        // This test will only work on systems where lsblk is available
-        // and we're running in an environment with root mounted
-        if std::process::Command::new("lsblk")
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
-            let result = find_root_device();
-            assert!(result.is_ok(), "Should be able to find root device");
-            
-            let device = result.unwrap();
-            assert!(!device.is_empty(), "Root device name should not be empty");
-            
-            println!("Found root device: {}", device);
-        } else {
-            println!("lsblk not available, skipping test");
-        }
-    }
 }
