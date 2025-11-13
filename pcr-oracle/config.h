@@ -1,0 +1,4 @@
+
+#define LIBTSS2_VERSION		"4.1.3"
+
+#undef DEBUG_AUTHENTICODE
