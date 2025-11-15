@@ -9,6 +9,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <memory>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -29,6 +30,8 @@ Checklist:
  - PCR prediction testing
 */
 
+#define DATA_DIR "/var/lib/luksury"
+#define ROOT_KEY_FILE DATA_DIR"/root_keyfile.bin"
 ESYS_CONTEXT *g_esys_ctx = nullptr;
 std::vector<std::string> errors;
 std::string root_device_name;
@@ -905,32 +908,91 @@ bool getParentUUIDOfRootDevice() {
     }
 }
 
+bool create_folder(const std::string& folderPath) {
+    if (mkdir(folderPath.c_str(), 0755) == 0) {
+        return true;
+    } else {
+        if (errno == EEXIST) {
+//            std::cout << "Folder '" << folderPath << "' already exists." << std::endl;
+            return true;
+        } else {
+            std::cout << "Error: Failed to create folder '" << folderPath << "'. Error: " << strerror(errno) << std::endl;
+            return false;
+        }
+    }
+}        
 
-bool inputpasword()
+std::uintmax_t getFileSize(const std::string& filepath) {
+    try {
+        return std::filesystem::file_size(filepath);
+    } catch (const std::filesystem::filesystem_error& e) {
+        return -1; // Return -1 on error
+    }
+}
+
+bool initial_setup()
 {
+    if (create_folder(DATA_DIR)==false) return false;
+
+    if (getFileSize(ROOT_KEY_FILE)==32)
+    {
+        std::cout << "note: extra key and root partition has been added before.\n";
+        return true;
+    }
+    std::string user_password = "a";
+
     std::string command = "cryptsetup luksOpen --test-passphrase /dev/"+root_device_name+" --key-file - --tries=1 --verbose";
 
-    auto result = exec(command.c_str(),"a");
+    auto result = exec(command.c_str(),user_password);
     std::cout << result;
     if (result.find("Command succesful.") == std::string::npos) {
         std::cout<<"Wrong password." << std::endl;
         exit(0);
         return false;
     }
+
+    exec((std::string("dd if=/dev/random of=") + ROOT_KEY_FILE + " bs=32 count=1").c_str());
+    if (getFileSize(std::string(ROOT_KEY_FILE))!=32)
+    {
+        adderror("Failed to create root keyfile");
+        return false;        
+    }
+
 //    std::cout << "Password accepted." << std::endl;
     if (result.find("Key slot 0 unlocked.")!=std::string::npos) {
         std::cout << "Moving your password from slot 0 to another slot in the LUKS header\n";
-        
-        return true;
+
+        // add a second keys of the user's password
+        std::string command = "cryptsetup luksAdd --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
+        auto result = exec(command.c_str(),user_password);  
+        std::cout << result << std::endl;
+
+         // delete slot 0 to make space for the generated key
+        std::string command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1";
+        auto result = exec(command.c_str(),user_password);
+        std::cout << result << std::endl;
     }
+
+    std::cout << "Adding a keyfile to root partition for fast and secure unlocking\n";
+    std::string command = "cryptsetup luksAdd --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
+    auto result = exec(command.c_str()); 
+    std::cout << result << std::endl;
+    if (result.find("Command succesful.") == std::string::npos) {
+        remove("ROOT_KEY_FILE");
+        adderror("Failed to add root keyfile to LUKS header");
+        return false;
+    }
+
+
     return true;
 }
 
 
 int main(int argc, char* argv[])
 {
+    create_folder(DATA_DIR);
     getParentUUIDOfRootDevice();
-    inputpasword();
+    initial_setup();
 //    std::cout << getParentUUIDOfRootDevice() << std::endl;
 //    editCrypttab(getParentUUIDOfRootDevice());
     return 0;
