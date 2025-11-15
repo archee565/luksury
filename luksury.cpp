@@ -665,24 +665,105 @@ bool editCrypttab(const std::string& uuid) {
     return true;
 }
 
-std::string exec(const char* cmd, std::string input="") {
-    std::array<char, 128> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, input.size()==0?"r":"w"), pclose);
-    if (!pipe) {
-        throw std::runtime_error("popen() failed!");
-    }
 
-    if (!input.empty()) {
-        fwrite(input.c_str(), 1, input.size(), pipe.get());
-    }
+#include <sys/wait.h>
 
-
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
+class Pipe {
+private:
+    int fd[2];
+    
+public:
+    Pipe() {
+        if (pipe(fd) == -1) {
+            throw std::runtime_error("pipe() failed");
+        }
     }
-    return result;
+    
+    ~Pipe() {
+        closeRead();
+        closeWrite();
+    }
+    
+    int getRead() const { return fd[0]; }
+    int getWrite() const { return fd[1]; }
+    
+    void closeRead() {
+        if (fd[0] != -1) {
+            close(fd[0]);
+            fd[0] = -1;
+        }
+    }
+    
+    void closeWrite() {
+        if (fd[1] != -1) {
+            close(fd[1]);
+            fd[1] = -1;
+        }
+    }
+};
+
+std::string exec(const std::string& command, const std::string& input="") {
+    Pipe stdin_pipe;  // Parent writes, child reads
+    Pipe stdout_pipe; // Child writes, parent reads
+    
+    pid_t pid = fork();
+    
+    if (pid == -1) {
+        throw std::runtime_error("fork() failed");
+    }
+    
+    if (pid == 0) { // Child process
+        // Redirect stdin and stdout
+        dup2(stdin_pipe.getRead(), STDIN_FILENO);
+        dup2(stdout_pipe.getWrite(), STDOUT_FILENO);
+        
+        // Close all pipe ends in child
+        stdin_pipe.closeWrite();
+        stdin_pipe.closeRead();
+        stdout_pipe.closeRead();
+        stdout_pipe.closeWrite();
+        
+        // Execute the command
+        execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+        
+        // If execl fails
+        std::cerr << "execl() failed" << std::endl;
+        exit(1);
+    } else { // Parent process
+        // Close unused ends
+        stdin_pipe.closeRead();
+        stdout_pipe.closeWrite();
+        
+        // Write input to child
+        ssize_t bytes_written = write(stdin_pipe.getWrite(), input.c_str(), input.size());
+        if (bytes_written == -1) {
+            throw std::runtime_error("write() to child failed");
+        }
+        
+        // Close stdin to signal EOF
+        stdin_pipe.closeWrite();
+        
+        // Read output from child
+        std::string result;
+        std::array<char, 256> buffer;
+        ssize_t bytes_read;
+        
+        while ((bytes_read = read(stdout_pipe.getRead(), buffer.data(), buffer.size())) > 0) {
+            result.append(buffer.data(), bytes_read);
+        }
+        
+        if (bytes_read == -1) {
+            throw std::runtime_error("read() from child failed");
+        }
+        
+        // Wait for child to complete
+        int status;
+        waitpid(pid, &status, 0);
+        
+        return result;
+    }
 }
+
 
 std::string findRootDevice(const Json::Value& device, const std::string& currentName = "") {
     // Check if this device is mounted at /
@@ -712,7 +793,7 @@ std::string findRootDevice(const Json::Value& device, const std::string& current
     return "";
 }
 
-bool getParentUUIDOfRootDevice() {
+bool find_root_partition_data() {
     try {
         // Execute lsblk command
         std::string output = exec("lsblk -J -o MOUNTPOINT,UUID,NAME");
@@ -839,20 +920,20 @@ void system_checks()
     if (getFileSize("/boot/vmlinuz")<1) adderror("Can't access /boot/vmlinuz");
 
     if (predictpcrs()==false) adderror("PCR prediction doesn't work.");
+
+    if (root_device_name.empty() || root_device_uuid.empty())
+    {
+        adderror("Failed to find root partition details.");
+    }
 }
 
 bool initial_setup()
 {
     system_checks();
     if (errors.size()) return false;
-//    return false;
 
     if (create_folder(DATA_DIR)==false) return false;
 
-    if (editCrypttab(root_device_uuid)==false)
-    {
-        return false;
-    }
 
     if (getFileSize(ROOT_KEY_FILE)==32)
     {
@@ -864,8 +945,8 @@ bool initial_setup()
     std::string command = "cryptsetup luksOpen --test-passphrase /dev/"+root_device_name+" --key-file - --tries=1 --verbose";
 
     auto result = exec(command.c_str(),user_password);
-    std::cout << result;
-    if (result.find("Command succesful.") == std::string::npos) {
+    std::cout << result << std::endl;
+    if (result.find("Command successful.") == std::string::npos) {
         std::cout<<"Wrong password." << std::endl;
         exit(0);
         return false;
@@ -883,7 +964,7 @@ bool initial_setup()
         std::cout << "Moving your password from slot 0 to another slot in the LUKS header\n";
 
         // add a second keys of the user's password
-        command = "cryptsetup luksAdd --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
+        command = "cryptsetup luksAddKey --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
         result = exec(command.c_str(),user_password);  
         std::cout << result << std::endl;
 
@@ -894,12 +975,17 @@ bool initial_setup()
     }
 
     std::cout << "Adding a larger key to root partition for fast and secure unlocking\n";
-    command = "cryptsetup luksAdd --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
+    command = "cryptsetup luksAddKey --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
     result = exec(command.c_str()); 
     std::cout << result << std::endl;
     if (result.find("Command succesful.") == std::string::npos) {
         remove("ROOT_KEY_FILE");
         adderror("Failed to add root keyfile to LUKS header");
+        return false;
+    }
+
+    if (editCrypttab(root_device_uuid)==false)
+    {
         return false;
     }
 
@@ -943,6 +1029,7 @@ int main(int argc, char* argv[])
         return 1;
     }
     init_pcr_selection(pcrSelection, pcr_list);
+    find_root_partition_data();
 
     initial_setup();
     return 0;
