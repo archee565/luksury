@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <unistd.h>
 #include <jsoncpp/json/json.h>  // Requires jsoncpp library
 
 #include <openssl/sha.h>  
@@ -22,20 +23,20 @@
 
 /*
 Checklist: 
- - booted by systemd or grub
- - is root
- - Dracut system?
  - TPM2.0 support,tools ?
  - root encrypted, found?
  - PCR prediction testing
 */
 
+std::vector<int> pcr_list = {4,5,9};
 #define DATA_DIR "/var/lib/luksury"
-#define ROOT_KEY_FILE DATA_DIR"/root_keyfile.bin"
+#define ROOT_KEY_FILE DATA_DIR "/root_keyfile.bin"
 ESYS_CONTEXT *g_esys_ctx = nullptr;
 std::vector<std::string> errors;
 std::string root_device_name;
 std::string root_device_uuid;
+TPML_PCR_SELECTION pcrSelection;
+
 
 #define ZERO(x) memset(&x,0, sizeof(x))
 
@@ -443,168 +444,6 @@ int seal_secret_to_persistent(
     return true;
 }
 
-
-// Main function: seal secret into a persistent handle using precomputed PCR digest.
-// Parameters:
-// - esys: ESAPI context
-// - persistentHandle: desired persistent handle (e.g. 0x81010001). Must be free or you will need to Evict first.
-// - secret: bytes of data to seal
-// - pcrSelection: TPML_PCR_SELECTION describing which PCR indices & hash algs the digest corresponds to
-// - pcrDigestBytes: the precomputed PCR composite digest (for the supplied pcrSelection) — raw bytes (e.g. SHA256 length when SHA256 used)
-// NOTE: caller must have sufficient rights (owner) to call EvictControl to make persistent.
-int seal_secret_to_persistent_bad(
-    uint32_t persistentHandle,
-    const std::vector<uint8_t>& secret,
-    const TPML_PCR_SELECTION &pcrSelection,
-    const std::vector<uint8_t>& pcrConcatenated
-) {
-    // 1) Start a trial policy session to compute the policy digest for PolicyPCR.
-    ESYS_TR sessionTrial = ESYS_TR_NONE;
-	static const TPMT_SYM_DEF symmetric = {
-		.algorithm = TPM2_ALG_AES,
-		.keyBits = { .aes = 128 },
-		.mode = { .aes = TPM2_ALG_CFB }
-	};
-
-    TSS2_RC rc = Esys_StartAuthSession(
-        g_esys_ctx,
-        ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,ESYS_TR_NONE, ESYS_TR_NONE,
-        0,
-        TPM2_SE_TRIAL, &symmetric, TPM2_ALG_SHA256,
-        &sessionTrial
-    );
-    if (check_rc(rc, "Esys_StartAuthSession (trial)")) return 1;
-
-    // Prepare TPM2B_DIGEST for the PCR digest input to PolicyPCR:
-    TPM2B_DIGEST pcrDigest = concatenated_to_digest(pcrConcatenated);
-
-    // call PolicyPCR with the precomputed digest and selection
-    rc = Esys_PolicyPCR(
-        g_esys_ctx,
-        sessionTrial,
-        ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-        &pcrDigest,
-        const_cast<TPML_PCR_SELECTION*>(&pcrSelection)
-    );
-    if (check_rc(rc, "Esys_PolicyPCR")) return 1;
-
-    // Retrieve the resulting policyDigest
-    TPM2B_DIGEST *policyDigest = nullptr;
-    rc = Esys_PolicyGetDigest(
-        g_esys_ctx,
-        sessionTrial,
-        ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-        &policyDigest
-    );
-    if (check_rc(rc, "Esys_PolicyGetDigest")) return 1;
-
-    // 2) Create a sealed object template with authPolicy set to policyDigest
-    TPM2B_SENSITIVE_CREATE inSensitive = {};
-    inSensitive.size = sizeof(TPM2B_SENSITIVE_CREATE);
-    inSensitive.sensitive.userAuth.size = 0; // no additional auth; policy protects usage
-    // Put the secret in sensitive.data
-    if (secret.size() > sizeof(inSensitive.sensitive.data.buffer)) {
-        Esys_FlushContext(g_esys_ctx, sessionTrial);
-        adderror("secret too large to store in TPM sensitive area");
-        return 1;
-    }
-    inSensitive.sensitive.data.size = (UINT16)secret.size();
-    if (!secret.empty()) memcpy(inSensitive.sensitive.data.buffer, secret.data(), secret.size());
-
-    TPM2B_PUBLIC inPublic = {};
-    inPublic.size = sizeof(TPM2B_PUBLIC);
-    inPublic.publicArea.type = TPM2_ALG_KEYEDHASH;           // sealed data uses keyedhash type
-    inPublic.publicArea.nameAlg = TPM2_ALG_SHA256;           // name algorithm
-    inPublic.publicArea.objectAttributes = (TPMA_OBJECT) (
-        TPMA_OBJECT_FIXEDTPM |
-        TPMA_OBJECT_FIXEDPARENT |
-        TPMA_OBJECT_USERWITHAUTH /* or 0 */  // we rely on policy, adjust as needed
-        // Do NOT set DECRYPT/ENCRYPT if you only want sealed data accessible via Policy
-    );
-    // Set the authPolicy to the computed policy digest
-    if (policyDigest->size > sizeof(inPublic.publicArea.authPolicy.buffer)) {
-        Esys_FlushContext(g_esys_ctx, sessionTrial);
-        Esys_Free(policyDigest);
-        adderror("policy too large");
-        return 1;
-    }
-    inPublic.publicArea.authPolicy.size = policyDigest->size;
-    memcpy(inPublic.publicArea.authPolicy.buffer, policyDigest->buffer, policyDigest->size);
-
-    // keyedHash parameters: no scheme (TPM2_ALG_NULL) for sealed data
-    inPublic.publicArea.parameters.keyedHashDetail.scheme.scheme = TPM2_ALG_NULL;
-    inPublic.publicArea.unique.keyedHash.size = 0;
-
-    TPM2B_DATA outsideInfo = {};
-    TPML_PCR_SELECTION creationPCR = {}; // none
-    // 3) Create the object under a storage primary key
-    ESYS_TR primaryHandle = create_storage_primary(g_esys_ctx);
-
-    TPM2B_PRIVATE *outPrivate = nullptr;
-    TPM2B_PUBLIC *outPublic = nullptr;
-    rc = Esys_Create(
-        g_esys_ctx,
-        primaryHandle,
-        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-        &inSensitive,
-        &inPublic,
-        &outsideInfo,
-        &creationPCR,
-        &outPrivate,
-        &outPublic,
-        nullptr, nullptr, nullptr
-    );
-    
-    if (check_rc(rc, "Esys_Create")) return 0;
-
-    // 4) Load the created object
-    ESYS_TR objectHandle = ESYS_TR_NONE;
-    rc = Esys_Load(
-        g_esys_ctx,
-        primaryHandle,
-        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-        outPrivate,
-        outPublic,
-        &objectHandle
-    );
-    if (check_rc(rc, "Esys_Load")) return 0;
-
-    // 5) Make the object persistent at persistentHandle (requires owner auth)
-    // EvictControl: hierarchy ESYS_TR_RH_OWNER, objectHandle -> persistentHandle
-    rc = Esys_EvictControl(
-        g_esys_ctx,
-        ESYS_TR_RH_OWNER,
-        objectHandle,
-        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-        persistentHandle,
-        nullptr
-    );
-    if (rc != TSS2_RC_SUCCESS) {
-        std::cerr << "Esys_EvictControl failed (maybe handle already in use): 0x" << std::hex << rc << std::dec << "\n";
-        // If handle already used you may want to call Esys_EvictControl to remove old object first.
-        // Clean up and exit for this example.
-        Esys_FlushContext(g_esys_ctx, objectHandle);
-        Esys_FlushContext(g_esys_ctx, primaryHandle);
-        Esys_Free(outPrivate);
-        Esys_Free(outPublic);
-        Esys_Free(policyDigest);
-        Esys_FlushContext(g_esys_ctx, sessionTrial);
-        adderror("Esys_EvictControl failed (maybe handle already in use):");
-        return 1;
-    }
-
-    std::cout << "Sealed object made persistent at 0x" << std::hex << persistentHandle << std::dec << "\n";
-
-    // 6) Cleanup: free created structures and flush contexts
-    Esys_FlushContext(g_esys_ctx, objectHandle);
-    Esys_FlushContext(g_esys_ctx, primaryHandle);
-    Esys_Free(outPrivate);
-    Esys_Free(outPublic);
-    Esys_Free(policyDigest);
-    Esys_FlushContext(g_esys_ctx, sessionTrial);
-    return 0;
-}
-
 int delete_persistent_handle(TPM2_HANDLE persistentHandle) {
     TSS2_RC rc = Esys_EvictControl(
         g_esys_ctx,
@@ -712,8 +551,9 @@ std::vector<std::string> split(const std::string& str) {
     return tokens;
 }
 
-bool editCrypttab(const std::string& uuid, const std::string& crypttabPath = "/etc/crypttab") {
+bool editCrypttab(const std::string& uuid) {
     const std::string keyscriptParam = "keyscript=/var/lib/luksury/luksury_initrd.sh";
+    const std::string crypttabPath = "/etc/crypttab";
     
     // Read the file
     std::ifstream inFile(crypttabPath);
@@ -930,13 +770,93 @@ std::uintmax_t getFileSize(const std::string& filepath) {
     }
 }
 
+namespace fs = std::filesystem;
+
+bool is_dracut_available() {
+    // Check if dracut executable exists in common locations
+    std::vector<std::string> possible_paths = {
+        "/usr/bin/dracut",
+        "/usr/sbin/dracut",
+        "/bin/dracut",
+        "/sbin/dracut"
+    };
+    
+    for (const auto& path : possible_paths) {
+        if (fs::exists(path) && fs::is_regular_file(path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_dracut_config() {
+    // Check for dracut configuration directory
+    if (fs::exists("/etc/dracut.conf") || fs::exists("/etc/dracut.conf.d")) {
+        return true;
+    }
+    
+    // Check for dracut modules directory
+    if (fs::exists("/usr/lib/dracut") || fs::exists("/usr/lib/dracut/modules.d")) {
+        return true;
+    }
+    
+    return false;
+}
+
+bool check_efivars()
+{
+   std::string path = "/sys/firmware/efi/efivars";
+    
+    for (const auto& entry : fs::directory_iterator(path)) {
+        if (entry.path().filename().string().find("LoaderInfo") == 0) {
+//            std::cout << "Found: " << entry.path() << std::endl;
+            return true;
+        }
+    }    
+    return false;
+}
+
+bool predictpcrs();
+
+void system_checks()
+{
+    if (getuid() != 0) 
+    {
+        adderror("You need to be root to run this program.");
+        return;
+    }
+
+    if (!is_dracut_available() || !has_dracut_config())
+    {
+        adderror("Only systems with dracut initRAMFS generator are supported. (Dracut is default on Ubuntu from release 25.10)");
+    }
+
+    if (!check_efivars()) adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
+
+    if (retrieve_current_pcr_values_concat(pcrSelection).empty()) adderror("Can't access TPM2");
+
+    if (getFileSize("/boot/initrd.img")<1) adderror("Can't access /boot/initrd.img");
+    if (getFileSize("/boot/vmlinuz")<1) adderror("Can't access /boot/vmlinuz");
+
+    if (predictpcrs()==false) adderror("PCR prediction doesn't work.");
+}
+
 bool initial_setup()
 {
+    system_checks();
+    if (errors.size()) return false;
+//    return false;
+
     if (create_folder(DATA_DIR)==false) return false;
+
+    if (editCrypttab(root_device_uuid)==false)
+    {
+        return false;
+    }
 
     if (getFileSize(ROOT_KEY_FILE)==32)
     {
-        std::cout << "note: extra key and root partition has been added before.\n";
+        std::cout << "note: extra key on root partition has been added before.\n";
         return true;
     }
     std::string user_password = "a";
@@ -963,19 +883,19 @@ bool initial_setup()
         std::cout << "Moving your password from slot 0 to another slot in the LUKS header\n";
 
         // add a second keys of the user's password
-        std::string command = "cryptsetup luksAdd --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
-        auto result = exec(command.c_str(),user_password);  
+        command = "cryptsetup luksAdd --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
+        result = exec(command.c_str(),user_password);  
         std::cout << result << std::endl;
 
          // delete slot 0 to make space for the generated key
-        std::string command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1";
-        auto result = exec(command.c_str(),user_password);
+        command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1";
+        result = exec(command.c_str(),user_password);
         std::cout << result << std::endl;
     }
 
-    std::cout << "Adding a keyfile to root partition for fast and secure unlocking\n";
-    std::string command = "cryptsetup luksAdd --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
-    auto result = exec(command.c_str()); 
+    std::cout << "Adding a larger key to root partition for fast and secure unlocking\n";
+    command = "cryptsetup luksAdd --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
+    result = exec(command.c_str()); 
     std::cout << result << std::endl;
     if (result.find("Command succesful.") == std::string::npos) {
         remove("ROOT_KEY_FILE");
@@ -987,31 +907,49 @@ bool initial_setup()
     return true;
 }
 
-
-int main(int argc, char* argv[])
+bool predictpcrs()
 {
-    create_folder(DATA_DIR);
-    getParentUUIDOfRootDevice();
-    initial_setup();
-//    std::cout << getParentUUIDOfRootDevice() << std::endl;
-//    editCrypttab(getParentUUIDOfRootDevice());
-    return 0;
-
-    TSS2_RC rc;
-    rc = Esys_Initialize(&g_esys_ctx, nullptr, nullptr);
-    if (rc != TSS2_RC_SUCCESS) {
-        std::cerr << "Esys_Initialize failed: 0x" << std::hex << rc << std::endl;
-        return 1;
-    }
-
-    std::vector<int> pcr_list = {4,5,9};
-    TPML_PCR_SELECTION pcrSelection;
-    init_pcr_selection(pcrSelection, pcr_list);
-
     auto pcr_string = pcr_list_to_string(pcr_list);
     char *args[]={"pcr-oracle","--from","eventlog","-F","luksury",&pcr_string[0]};
     predicted_pcr_conc.clear();
     main_pcr_oracle(6, (args));
+    if (predicted_pcr_conc.size()!=pcr_list.size() * SHA256_DIGEST_LENGTH)
+    {
+        adderror("PCR prediction failed.");
+        return false;
+    }
+    return true;
+}
+
+
+//todo: test luks optimizer, save persistent handle slot, install hooks
+
+bool update_pcrs()
+{
+}
+
+
+int main(int argc, char* argv[])
+{
+    if (getuid() != 0) 
+    {
+        adderror("You need to be root to run this program.");
+        return 1;
+    }
+    TSS2_RC rc;
+    rc = Esys_Initialize(&g_esys_ctx, nullptr, nullptr);
+    if (rc != TSS2_RC_SUCCESS) {
+        std::cerr << "Error: Can't access TPM2. " << Tss2_RC_Decode(rc) << std::endl;
+        return 1;
+    }
+    init_pcr_selection(pcrSelection, pcr_list);
+
+    initial_setup();
+    return 0;
+
+
+    predictpcrs();
+
 
     auto current_pcr_concat = retrieve_current_pcr_values_concat(pcrSelection);
 
