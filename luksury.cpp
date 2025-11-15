@@ -38,6 +38,12 @@ std::string root_device_uuid;
 TPML_PCR_SELECTION pcrSelection;
 int verbosity = 1;
 
+struct {
+    char text[16];
+    TPM2_HANDLE handle;
+} persistent_handle;
+
+
 
 #define ZERO(x) memset(&x,0, sizeof(x))
 
@@ -661,7 +667,7 @@ std::vector<std::string> split(const std::string& str) {
     return tokens;
 }
 
-bool editCrypttab(const std::string& uuid) {
+bool editCrypttab(const std::string& uuid, bool dry_run) {
     const std::string keyscriptParam = "keyscript=/var/lib/luksury/luksury_initrd.sh";
     const std::string crypttabPath = "/etc/crypttab";
     
@@ -764,14 +770,14 @@ bool editCrypttab(const std::string& uuid) {
     }
     
     // Atomically replace original file
-    if (0)
+    if (!dry_run)
     if (rename(tempPath.c_str(), crypttabPath.c_str()) != 0) {
         std::cerr << "Error: Cannot replace original file" << std::endl;
         remove(tempPath.c_str());
         return false;
     }
     
-    std::cout << "Successfully added keyscript parameter for UUID " << uuid << std::endl;
+    if (!dry_run) std::cout << "Successfully added keyscript parameter for UUID " << uuid << std::endl;
     return true;
 }
 
@@ -1070,16 +1076,12 @@ void system_checks()
     {
         adderror("Failed to find root partition details.");
     }
+
+    editCrypttab(root_device_uuid,true);
 }
 
-bool initial_setup()
+bool extra_luks_key_setup()
 {
-    system_checks();
-    if (errors.size()) return false;
-
-    if (create_folder(DATA_DIR)==false) return false;
-
-
     if (getFileSize(ROOT_KEY_FILE)==32)
     {
         std::cout << "note: extra key on root partition has been added before.\n";
@@ -1101,6 +1103,7 @@ bool initial_setup()
     }
 
     exec((std::string("dd if=/dev/random of=") + ROOT_KEY_FILE + " bs=32 count=1").c_str());
+    exec(std::string("chmod 600 ")+ROOT_KEY_FILE);
     if (getFileSize(std::string(ROOT_KEY_FILE))!=32)
     {
         adderror("Failed to create root keyfile");
@@ -1144,12 +1147,48 @@ bool initial_setup()
         adderror("Failed to add root keyfile to LUKS header");
         return false;
     }
+}
 
-    if (editCrypttab(root_device_uuid)==false)
-    {
-        return false;
+
+bool getTPMHandleAddress()
+{
+    std::ifstream inFile(DATA_DIR "/persistent_handle.bin");
+    if (inFile.is_open()) {
+        inFile.read((char *)&persistent_handle.handle, sizeof(persistent_handle.handle));
     }
+    else
+    {
+        persistent_handle.handle = find_free_handle();
+        TPM2_HANDLE  find_free_handle();
+        std::ofstream outFile(DATA_DIR "/persistent_handle.bin");
+        if (!outFile.is_open()) {
+            adderror("Failed to write persistent handle to file");
+            return false;
+        }
+        outFile.write((const char *)&persistent_handle.handle, sizeof(persistent_handle.handle));
+    }
+    snprintf(persistent_handle.text, sizeof(persistent_handle.text), "0x%x", persistent_handle.handle);
+    return true;
+}
 
+bool initial_setup()
+{
+    system_checks();
+    if (errors.size()) return false;
+
+    if (create_folder(DATA_DIR)==false) return false;
+
+    if (!extra_luks_key_setup()) return false;
+
+    if (editCrypttab(root_device_uuid,false)==false) return false;
+
+    if (!getTPMHandleAddress()) return false;
+
+    // install hooks
+
+    // regen initramfs
+
+    // update pcrs -> replace kernel and initrd files
 
     return true;
 }
