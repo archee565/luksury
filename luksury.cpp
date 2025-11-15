@@ -36,6 +36,7 @@ std::vector<std::string> errors;
 std::string root_device_name;
 std::string root_device_uuid;
 TPML_PCR_SELECTION pcrSelection;
+int verbosity = 1;
 
 
 #define ZERO(x) memset(&x,0, sizeof(x))
@@ -45,6 +46,115 @@ void adderror(const std::string& msg)
     std::cout << "Error: " << msg << std::endl; 
     errors.push_back(msg);
 }
+
+#include <cstdio>
+#include <stdexcept>
+#include <cstring>
+
+class Tempfile {
+private:
+    std::string filepath;
+    bool file_created;
+
+// Common file creation logic
+    void create_file(const char* data, size_t size) {
+        char template_path[] = "/tmp/tempfile_XXXXXX";
+        int fd = mkstemp(template_path);
+        
+        if (fd == -1) {
+            throw std::runtime_error("Failed to create temporary file: " + std::string(strerror(errno)));
+        }
+        
+        filepath = template_path;
+        file_created = true;
+        
+        // Write data to the file
+        std::ofstream file(filepath, std::ios::binary);
+        if (!file) {
+            close(fd);
+            throw std::runtime_error("Failed to open temporary file for writing: " + filepath);
+        }
+        
+        file.write(data, size);
+        file.close();
+        close(fd);
+        
+        if (!file) {
+            throw std::runtime_error("Failed to write data to temporary file: " + filepath);
+        }
+    }
+
+public:
+    // Constructor with std::vector<unsigned char>
+    Tempfile(const std::vector<unsigned char>& data) : file_created(false) {
+        create_file(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    // Constructor with std::string
+    Tempfile(const std::string& data) : file_created(false) {
+        create_file(data.data(), data.size());
+    }
+    // Get the file path
+    const std::string& get_path() const {
+        return filepath;
+    }
+
+    // Check if file was successfully created
+    bool is_created() const {
+        return file_created;
+    }
+
+    // Read the file content (optional utility method)
+    std::vector<unsigned char> read_content() const {
+        if (!file_created) {
+            throw std::runtime_error("Temporary file was not created");
+        }
+        
+        std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::runtime_error("Failed to open temporary file for reading: " + filepath);
+        }
+        
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        
+        std::vector<unsigned char> buffer(size);
+        file.read(reinterpret_cast<char*>(buffer.data()), size);
+        
+        return buffer;
+    }
+
+    // Destructor - deletes the file
+    ~Tempfile() {
+        if (file_created) {
+            std::remove(filepath.c_str());
+        }
+    }
+
+    // Delete copy constructor and assignment operator to prevent accidental copies
+    Tempfile(const Tempfile&) = delete;
+    Tempfile& operator=(const Tempfile&) = delete;
+
+    // Allow move semantics
+    Tempfile(Tempfile&& other) noexcept 
+        : filepath(std::move(other.filepath)), file_created(other.file_created) {
+        other.file_created = false;
+    }
+    
+    Tempfile& operator=(Tempfile&& other) noexcept {
+        if (this != &other) {
+            // Clean up current file
+            if (file_created) {
+                std::remove(filepath.c_str());
+            }
+            
+            filepath = std::move(other.filepath);
+            file_created = other.file_created;
+            other.file_created = false;
+        }
+        return *this;
+    }
+    };
 
 ESYS_CONTEXT *tss_esys_context() {
     ESYS_CONTEXT *ctx = nullptr;
@@ -666,8 +776,43 @@ bool editCrypttab(const std::string& uuid) {
 }
 
 
-#include <sys/wait.h>
+struct CommandResult {
+    std::string output;
+    int exit_status;
+};
 
+CommandResult exec_status(const std::string& command) {
+    if (verbosity) 
+    {
+        std::cout << ".> " << command << std::endl;
+    }
+//    const char* cmd = (command + " 2>&1").c_str();
+    const char* cmd = (command).c_str();
+    
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    
+    if (!pipe) {
+        throw std::runtime_error("popen() failed!");
+    }
+    
+    CommandResult result;
+    char buffer[128];
+    while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+        result.output += buffer;
+    }
+    
+    // Get the exit status
+    result.exit_status = pclose(pipe.release());
+    
+    return result;
+}
+
+std::string exec(const std::string&command)
+{
+    return exec_status(command).output;
+}
+
+#include <sys/wait.h>
 class Pipe {
 private:
     int fd[2];
@@ -702,7 +847,7 @@ public:
     }
 };
 
-std::string exec(const std::string& command, const std::string& input="") {
+std::string exec_with_input(const std::string& command, const std::string& input="") {
     Pipe stdin_pipe;  // Parent writes, child reads
     Pipe stdout_pipe; // Child writes, parent reads
     
@@ -940,13 +1085,16 @@ bool initial_setup()
         std::cout << "note: extra key on root partition has been added before.\n";
         return true;
     }
-    std::string user_password = "a";
 
-    std::string command = "cryptsetup luksOpen --test-passphrase /dev/"+root_device_name+" --key-file - --tries=1 --verbose";
+    std::cout << "Enter passphrase for /dev/" << root_device_name << std::endl;
 
-    auto result = exec(command.c_str(),user_password);
-    std::cout << result << std::endl;
+    Tempfile passwdfile = Tempfile("a");
+
+    std::string command = "cryptsetup luksOpen --test-passphrase /dev/"+root_device_name+" --key-file "+passwdfile.get_path()+" --verbose";
+
+    auto result = exec(command.c_str());
     if (result.find("Command successful.") == std::string::npos) {
+        std::cout << result << std::endl;
         std::cout<<"Wrong password." << std::endl;
         exit(0);
         return false;
@@ -964,26 +1112,34 @@ bool initial_setup()
         std::cout << "Moving your password from slot 0 to another slot in the LUKS header\n";
 
         // add a second keys of the user's password
-        command = "cryptsetup luksAddKey --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1 --verbose";
-        result = exec(command.c_str(),user_password);  
+        command = "cryptsetup luksAddKey --iter-time=500 --key-file "+passwdfile.get_path()+" --verbose /dev/"+root_device_name+" "+passwdfile.get_path();
         std::cout << result << std::endl;
         if (result.find("Command successful.")==std::string::npos)
         {
+            result = exec(command.c_str());  
+            remove("ROOT_KEY_FILE");
             adderror("Failed to move password from slot 0 to another slot");
             return false;
         }
 
+        std::cout << "Deleting your password from slot 0\n";
          // delete slot 0 to make space for the generated key
-        command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1 --verbose";
-        result = exec(command.c_str(),user_password);
-        std::cout << result << std::endl;
+        command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file "+passwdfile.get_path()+" --verbose";
+        result = exec(command.c_str());
+        if (result.find("Command successful.")==std::string::npos)
+        {
+            std::cout << result << std::endl;
+            adderror("deleting luks key slot failed");
+            remove("ROOT_KEY_FILE");
+            return false;
+        }
     }
 
     std::cout << "Adding a larger key to root partition for fast and secure unlocking\n";
-    command = "cryptsetup luksAddKey --iter-time=5 /dev/"+root_device_name+" --key-file "ROOT_KEY_FILE" --tries=1 --verbose";
+    command = "cryptsetup luksAddKey --iter-time=5   --verbose  --key-file "+passwdfile.get_path()+" /dev/"+root_device_name+" "+ROOT_KEY_FILE;
     result = exec(command.c_str()); 
-    std::cout << result << std::endl;
-    if (result.find("Command succesful.") == std::string::npos) {
+    if (result.find("Command successful.") == std::string::npos) {
+        std::cout << result << std::endl;
         remove("ROOT_KEY_FILE");
         adderror("Failed to add root keyfile to LUKS header");
         return false;
