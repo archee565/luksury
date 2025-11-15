@@ -964,12 +964,17 @@ bool initial_setup()
         std::cout << "Moving your password from slot 0 to another slot in the LUKS header\n";
 
         // add a second keys of the user's password
-        command = "cryptsetup luksAddKey --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1";
+        command = "cryptsetup luksAddKey --iter-time=500 /dev/"+root_device_name+" --key-file - --tries=1 --verbose";
         result = exec(command.c_str(),user_password);  
         std::cout << result << std::endl;
+        if (result.find("Command successful.")==std::string::npos)
+        {
+            adderror("Failed to move password from slot 0 to another slot");
+            return false;
+        }
 
          // delete slot 0 to make space for the generated key
-        command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1";
+        command = "cryptsetup luksKillSlot /dev/"+root_device_name+" 0 --key-file - --tries=1 --verbose";
         result = exec(command.c_str(),user_password);
         std::cout << result << std::endl;
     }
