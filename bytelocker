@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+#import hashlib
+#import signify.fingerprinter
+import binascii
+import subprocess
+import argparse
+from os.path import exists
+import os
+import errno
+import getpass
+import stat
+
+DATADIR="/var/lib/bytelocker/"
+EFIFILE="/boot/efi/EFI/BYTELOCKER/linux.efi"
+LUKSKEY="/crypto_keyfile_bytelocker.bin"
+verbose = True
+optimizeLUKS = True
+toDeletes = []
+
+def cleanup():
+    for file in toDeletes:
+        os.remove(file)
+
+def mkdirsafe(dirname):
+    try:
+        os.mkdir(dirname)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+        pass
+
+def unix_to_windows_path(path):
+    # Replace forward slashes with backslashes
+    windows_path = path.replace('/', '\\')
+    
+    # Convert the entire path to uppercase
+    windows_path = windows_path.upper()
+    
+    return windows_path
+
+#def hashefi():
+#    fh=open(EFIFILE,"rb")
+#    fpr = signify.fingerprinter.AuthenticodeFingerprinter(fh)
+#    fpr.add_authenticode_hashers(getattr(hashlib, alg))
+#    return fpr.hash()[alg]
+
+#def getpcr4():
+#    if alg=="sha1":
+#        startval = binascii.unhexlify("b2a83b0ebf2f8374299a5b2bdfc31ea955ad7236")
+#    if alg=="sha256":
+#        startval = binascii.unhexlify("3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969")
+#    pcr4 = hashlib.new(alg, startval + hashefi()).digest()
+#    return pcr4
+
+def readfile(filename):
+    if exists(filename)==False:
+        return bytearray()
+    output=bytearray()
+    fh=open(filename,"rb");
+    buf = True
+    buf_size = 65536
+    while buf:
+        buf = fh.read(buf_size)
+        output = output + buf
+    return output
+
+def writefile(filename,buf,executable=False):
+    fh=os.open(filename,os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+#    fh=open(filename,"wb");
+    os.write(fh,buf)
+    os.close(fh)
+    os.chmod(filename,stat.S_IREAD|stat.S_IWRITE | (executable*stat.S_IEXEC))
+    
+
+def error(str):
+    print("Error: "+str)
+    cleanup()
+    exit(-1)
+
+def command_nopipe(cmd):
+    if verbose:
+        print("> "+  cmd)
+    os.system(cmd)
+
+def command(cmd):
+#    retval = subprocess.run(cmd,capture_output=True)
+    if verbose:
+        print("> "+  cmd)
+    try:
+        retval = subprocess.check_output(cmd,shell=True);
+    except subprocess.CalledProcessError as e:
+        print("Error while executing:\n"+cmd)
+        print(e.stderr)
+        exit(0)
+
+    return retval
+
+def removeNewLines(s):
+    while s[len(s)-1]=='\n' or s[len(s)-1]=='\r':
+        s = s[:len(s)-1]
+    return s
+
+
+def decomment(line):
+    out=bytearray()
+    lastch=b'\n'
+    for ch in line:
+        if ch==ord('#'):
+            break
+        if ch!=ord(' ') or lastch!=ch:
+            out.append(ch)
+            lastch = ch
+    return out
+
+
+def patch_mkinitcpio_conf_arch():
+    lines = readfile("/etc/mkinitcpio.conf").split(b'\n')
+    output = bytearray()
+    patched = False
+    count = 0
+    for line in lines:
+        origline = line
+        line = decomment(line)
+        if line.find(b"FILES=")==0:
+            patched = True
+            origline = b"#"+line+b" #removed by Bytelocker"
+        if line.find(b'HOOKS=')==0 and line.find(b'bytelocker')==-1:
+            patched = True
+            line = line.replace(b" plymouth-encrypt",b" encrypt")
+            line = line.replace(b"plymouth ",b"")
+            line = line.replace(b" encrypt",b" bytelocker encrypt")
+            print(line)
+            origline = line
+        output += origline+b"\n"
+
+    if patched:
+        if not exists("/etc/mkinitcpio.conf.old"):
+            command_nopipe("mv /etc/mkinitcpio.conf /etc/mkinitcpio.conf.old")
+        writefile("/etc/mkinitcpio.conf",output)
+
+
+
+def patch_crypttab_ubuntu():
+    lines = readfile("/etc/crypttab").split(b'\n')
+    output = bytearray()
+    patched = False
+    count = 0
+    for line in lines:
+        origline = line
+        line = decomment(line)
+        line = line.replace(b",keyscript=/bin/cat",b"");	        
+        line = line.replace(b"keyscript=/bin/cat,",b"");	        
+        line = line.replace(b"keyscript=/bin/cat",b"");	        
+        cols = line.split(b' ')
+	        
+        if len(cols)>=4:
+	        print(b"luksuuid = "+luksuuid)
+	        print(b"col2 = " + cols[2])
+	        print(line)
+
+        if len(cols)>=4 and (line.find(luksuuid)!=-1 or cols[2]==b"/crypto_keyfile.bin") and cols[3].find(b"keyscript")==-1:
+            cols[2] = b"none"
+            cols[3] += b",keyscript="+DATADIR.encode()+b"bytelocker_unlock,initramfs"
+            newline = b' '.join(cols)
+            output += newline+b'\n'
+            count = count + 1
+            assert(patched==False)
+            patched = True
+        else:
+            output += origline+b'\n'
+
+    assert(count<=1)
+    assert(output.find(b"crypto_keyfile.bin")==-1)
+    if patched:
+        command_nopipe("mv /etc/crypttab /etc/crypttab.old")
+        writefile("/etc/crypttab",output)
+
+    # for extra safety 
+    confhookfilename = "/etc/cryptsetup-initramfs/conf-hook"
+    patched = False
+    lines = readfile(confhookfilename).split(b'\n')
+    output = bytearray()
+    for line in lines:
+        origline = line
+        line = decomment(line)
+        if line.find(b"KEYFILE_PATTERN"):
+            origline = b"# "+origline
+            patched = True
+        output += origline+b'\n'
+    if patched:
+        command_nopipe("mv "+confhookfilename+" "+confhookfilename+".old")
+        writefile(confhookfilename,output)
+
+ #   print(output.decode())
+
+def tableFind(lines,col,val):
+    i=0;
+    for line in lines:
+        cols = line.split(b' ')
+        if len(cols)>col and cols[col]==val:
+            return i;
+        i=i+1
+    return -1
+
+
+def findDevice():
+    global luksuuid
+    global luksdevicepath
+    retval = command("lsblk --fs -r -o PATH,KNAME,PKNAME,UUID,TYPE,MOUNTPOINT")
+    lines = retval.split(b'\n')
+    j = tableFind(lines,5,b"/")
+    if lines[j].split(b' ')[4]==b"part":
+        error("Root FS not encrypted")
+    
+    for i in range(0,6):
+        if lines[j].split(b' ')[4]==b"part":
+            break
+        j = tableFind(lines,1,lines[j].split(b' ')[2]) # find parent
+
+    luksdevicepath = lines[j].split(b' ')[0].decode()
+    luksuuid = lines[j].split(b' ')[3]
+
+
+# find a free split in the persistent NVRAM policies range
+def alloc_persistent_address(secondstage):
+    global persistent_address
+        
+    ret = command("tpm2_getcap properties-variable") # test if TPM2 working
+    if ret.find(b"TPM2_PT_HR_PERSISTENT_AVAIL:")==-1:
+        error("Can't access TPM2")
+
+    persistent_address = readfile(DATADIR+"persistentaddress.txt")
+    if len(persistent_address)>8:
+        return
+
+    if secondstage:
+        error("Run bytelocker setup first")
+
+    ret = command("tpm2_getcap handles-persistent")
+    for i in range(0x81000000,0x81000100):
+        if ret.find(hex(i).encode())==-1:
+            persistent_address = hex(i).encode()
+            break
+    writefile(DATADIR+"persistentaddress.txt",persistent_address)
+
+def installhooks_dracut():
+    hook = (
+        "#!/usr/bin/bash\n"
+        "    echo Hello Bytelocker\n"
+        "    echo 'Hello Bytelocker' >> /run/initramfs/bytelocker.txt\n"
+        "    modprobe -a -q tpm_crb >/dev/null 2>&1\n"
+        "    tpm2_unseal -c "+persistent_address.decode()+" -p pcr:" + alg+":0,2,4 -o /crypto_keyfile.bin >/dev/null 2>&1\n"
+        "if [ ! -f \"/crypto_keyfile.bin\" ]\n"
+        " then\n"
+        " echo Bytelocker could not decrypt system volume automatically\n"
+        " echo\n"
+        " echo\n"
+        " fi\n"
+        )
+
+    installer = (
+        "#!/bin/bash\n"
+        "check() {\n"
+        "    return 0\n"
+        "}\n"
+        "depends() {\n"
+        "    return 0\n"
+        "}\n"
+        "install() {\n"
+        "    inst_hook cmdline 10 \"$moddir/bytelocker_retrieve.sh\"\n"
+        "}\n"
+        )
+    mkdirsafe("/usr/lib/dracut/modules.d/89bytelocker");
+    writefile("/usr/lib/dracut/modules.d/89bytelocker/bytelocker_retrieve.sh", hook.encode(), True);
+    writefile("/usr/lib/dracut/modules.d/89bytelocker/module-setup.sh", installer.encode(), True);
+
+
+
+
+def installhooks_arch():
+    hook = (
+        "#!/usr/bin/bash\n"
+        "run_hook() {\n"
+        "    echo Hello Bytelocker\n"
+        "    modprobe -a -q tpm_crb >/dev/null 2>&1\n"
+        "    tpm2_unseal -c "+persistent_address.decode()+" -p pcr:" + alg+":0,2,4 -o /crypto_keyfile.bin >/dev/null 2>&1\n"
+        "if [ ! -f \"/crypto_keyfile.bin\" ]\n"
+        " then\n"
+        " echo Bytelocker could not decrypt system volume automatically\n"
+        " echo\n"
+        " echo\n"
+        " fi\n"
+        "}\n"
+        )
+
+    installer = (
+        "#!/bin/bash\n"
+        "build() {\n"
+        "    local mod\n"
+        "    add_module \"tpm_crb\"\n"
+        "    add_binary \"tpm2_unseal\"\n"
+        "    add_binary \"/usr/lib/libtss2-tcti-device.so\"\n"
+        "    add_runscript\n"
+        "}\n"
+        "help() {\n"
+        "\tcat <<HELPEOF\n"
+        "retrives the system disk encryption key from the TPM2, which will unseal it if the PCRs match\n"
+        "HELPEOF\n"
+        "}\n"
+    )
+
+    postupdate = (
+        "[Trigger]\n"
+        "Operation = Install\n"
+        "Operation = Upgrade\n"
+        "Type = Package\n"
+        "Target = linux\n"
+        "Target = fwupd\n"
+        "Target = systemd\n"
+        "Target = edk2-shell\n"
+        "\n"
+        "[Action]\n"
+        "Description =Updating bytelocker EFI and PCRs\n"
+        "When = PostTransaction\n"
+        "Exec = /usr/bin/bytelocker buildefi\n"
+    )
+
+    writefile("/usr/lib/initcpio/hooks/bytelocker",hook.encode(),False)
+    writefile("/usr/lib/initcpio/install/bytelocker",installer.encode(),False)
+    mkdirsafe("/etc/pacman.d/hooks")
+    writefile("/etc/pacman.d/hooks/99-bytelocker.hook",postupdate.encode())
+
+def findkernel_and_initramfs(writeimage):
+    global kernel
+    global initrd
+    global initrd_no_ucode
+
+    unamer = args.kernelname
+    print(unamer);
+    if unamer==None or not exists("/boot/initrd.img-"+unamer):
+        unamer = removeNewLines( command("uname -r").decode() )
+
+    k2 = "/boot/vmlinuz-"+unamer;
+    print(k2)
+    if exists(k2):
+        kernel = k2
+        initrd = "/boot/initrd.img-"+unamer;
+        print(initrd)
+    else:
+        kernel = "/boot/vmlinuz"
+        initrd = "/boot/initrd.img"
+
+    if not exists(initrd) or not exists(kernel):
+        lines = readfile("/boot/grub/grub.cfg").split(b'\n')
+        if len(lines)==0:
+            lines = readfile("/boot/grub2/grub.cfg").split(b'\n')
+                        
+        menuentry = 0;
+        for line in lines:
+            origline = line
+            line = decomment(line)
+            if line.find(b'menuentry')==0:
+                menuentry = menuentry+1
+
+            if menuentry==1:
+                if line.find(b'\tlinux')==0:
+                    i = 6;
+                    while len(line)>i and line[i]!=ord('/'):
+                        i+=1
+                    kernel = line[i:].split(b' ')[0].decode()
+
+                if line.find(b'\tinitrd')==0:
+                    i = 7;
+                    while len(line)>i and line[i]!=ord('/'):
+                        i+=1
+                    initrdlist = line[i:].split(b' ')
+                    if len(initrdlist)==1:
+                        initrd_no_ucode = initrd = initrdlist[0].decode()
+                    else:
+                        if writeimage:
+                            image = bytearray()
+                            for img in initrdlist:
+                                image += readfile(img.decode())
+                            initrd = "/tmp/initrd_combined"
+                            writefile(initrd,image)
+                        else:
+                            initrd = ""
+                        initrd_no_ucode = initrdlist[1].decode()
+
+#    if not exists(initrd):
+#        initrd = "/boot/initramfs-5.19.7-204.fsync.fc36.x86_64.img"
+#        kernel = "/boot/vmlinuz-5.19.11-201.fsync.fc36.x86_64"
+
+    if not exists(initrd):
+        initrd = "/boot"+initrd;
+        if not exists(initrd):
+            error("Can't find initRD");
+
+    if not exists(kernel):
+        kernel = "/boot"+kernel;
+        if not exists(kernel):
+            error("Can't find kernel");
+
+    print ("initrd found: "+initrd)
+    print ("kernel found: "+kernel)
+
+
+def buildefi():
+    findkernel_and_initramfs(True)
+    command_nopipe("cat /proc/cmdline > /tmp/kernel-command-line.txt\n")
+    command_nopipe(
+        "objcopy "
+        "--add-section .osrel=\"/usr/lib/os-release\" --change-section-vma .osrel=0x30000 "
+        "--add-section .cmdline=\"/tmp/kernel-command-line.txt\" --change-section-vma .cmdline=0x38000 "
+        "--add-section .linux=\"" + kernel + "\" --change-section-vma .linux=0x40000 "
+        "--add-section .initrd=\"" + initrd+ "\" --change-section-vma .initrd=0x2000000 " 
+        "\"/usr/lib/systemd/boot/efi/linuxx64.efi.stub\" \""+EFIFILE+"\"\n"
+    )
+
+    command_nopipe(
+        "/usr/lib/systemd/systemd-measure status"
+    )
+
+    command_nopipe(
+        "/usr/lib/systemd/systemd-measure "
+        "--osrel=\"/usr/lib/os-release\" "
+        "--cmdline=\"/tmp/kernel-command-line.txt\" "
+        "--linux=\"" + kernel + "\" "
+        "--initrd=\"" + initrd+ "\" "
+    )
+
+
+
+
+
+def installhooks_ubuntu():
+    initrdhook=(
+        "#!/bin/sh\n"
+        " export TPM2TOOLS_TCTI=\"device:/dev/tpm0\"\n"
+        " modprobe -a -q tpm_crb  > /run/initramfs/bytelocker.log 2>&1\n"
+        " tpm2_unseal -c "+persistent_address.decode()+" -p pcr:" + alg+":0,2,4 -o ./bytelocker_key.bin > /run/initramfs/bytelocker.log 2>&1\n"
+        " if [ -f \"./bytelocker_key.bin\" ]; then\n"
+        " cat ./bytelocker_key.bin\n"
+        " rm ./bytelocker_key.bin\n"
+        " exit 0\n"
+        " fi\n"
+        "/usr/lib/cryptsetup/askpass 'Bytelocker could not unlock system volume. Please enter passphrase'\n"
+        )
+    writefile(DATADIR+"bytelocker_unlock",initrdhook.encode(),True)
+
+    etchook=(
+        "#!/bin/sh\n"
+        "PREREQ=\"\"\n"
+        "prereqs()\n"
+        " {\n"
+        "   echo \"$PREREQ\"\n"
+        " }\n"
+        "case $1 in\n"
+        " prereqs)\n"
+        "   prereqs\n"
+        "   exit 0\n"
+        "   ;;\n"
+        "esac\n"
+        ". /usr/share/initramfs-tools/hook-functions\n"
+        "copy_exec /usr/bin/tpm2_unseal\n"
+        "copy_exec /usr/lib/libtss2-tcti-device.so\n"
+        "copy_exec /usr/lib/x86_64-linux-gnu/libtss2-tcti-device.so.0\n"
+        "copy_modules_dir kernel/drivers/char/tpm\n"
+        "exit 0\n"
+        )
+    writefile("/etc/initramfs-tools/hooks/bytelocker",etchook.encode(),True);
+
+    if false:
+        postupdatehook=(
+            "#!/bin/sh\n"
+            "echo Hello from post-update.d\n"
+            "bytelocker buildefi --kernelname=$1\n"
+        )
+
+        mkdirsafe("/etc/initramfs")
+        mkdirsafe("/etc/initramfs/post-update.d")
+        writefile("/etc/initramfs/post-update.d/bytelocker",postupdatehook.encode(),True)
+    
+def checkdeps():
+    global distro
+    if exists("/usr/bin/dracut"):
+        distro = "dracut"
+        return
+    if exists("/usr/sbin/update-initramfs"):
+        distro = "ubuntu"
+        return
+    if exists("/usr/bin/mkinitcpio"):
+        distro = "arch"
+        return
+    error("Unsupported initRAMFS system")
+
+def addBytelockerKey():
+    if exists(LUKSKEY):
+        return
+    
+    print("Root partition LUKS device detected: "+ luksdevicepath )
+
+    if optimizeLUKS:
+        passwd = getpass.getpass(prompt='Please type your LUKS password:')
+
+        userpassfile = "/tmp/userpass.txt";
+        toDeletes.append(userpassfile)
+
+        writefile(userpassfile,passwd.encode())
+
+        inputkey = "--key-file /tmp/userpass.txt ";
+        print("verifying passphrase")
+
+        res = command("cryptsetup luksOpen "+luksdevicepath+" --test-passphrase --verbose --key-file /tmp/userpass.txt");
+        if res.find(b"successful")==-1:
+             error("Wrong password supplied.")
+
+        if res.find(b"Key slot 0 unlocked")!=-1:   # User's password is in slot 0. Let's move it elsewhere
+            print( "moving LUKS passphrase from slot 0 to another slot.")
+            # half second time cost is ideal for typed passwords
+
+            res = command("cryptsetup luksAddKey --iter-time=500 --verbose --key-file /tmp/userpass.txt "+luksdevicepath+" "+userpassfile)
+            res = command("cryptsetup luksKillSlot "+luksdevicepath+" 0 --key-file /tmp/userpass.txt") # making sure,  bytelocker key is placesd in slot 0
+        
+    else:
+        if exists("/crypto_keyfile.bin"):
+            inputkey = "--key-file /crypto_keyfile.bin "
+
+    # note: high iteration count is recommended only for short and guessable passphrases 
+    # to slow down brute force attaks. For 256bit keys it's unnecessary. (2.2e+68 Years)
+    print("adding extra luks key")
+    command("dd if=/dev/random of=" + LUKSKEY + " bs=32 count=1")
+    res = command("cryptsetup luksAddKey --iter-time=50 "+luksdevicepath+" "+inputkey+" " + LUKSKEY)
+    return
+
+
+def findEFIDevice():
+    retval = command('lsblk --fs -o NAME,UUID,MOUNTPOINT -r')
+    lines = retval.split(b'\n')
+    for line in lines:
+        cols = line.split(b' ')
+        if len(cols)>=3:
+            if cols[2]==b'/boot/efi':
+                return cols[0]
+    error("Can't find EFI device")
+    return ''
+
+def findCurrentBootOptionName():
+    res = command("efibootmgr -v")
+    lines = res.split(b'\n')
+    cols = lines[0].split(b' ')
+    bootid = b"Boot" + cols[1]
+    for line in lines:
+        if line.find(bootid)==0:
+            i=0
+            while line[i]!=ord(' '):
+                i=i+1
+            if line[i]==ord(' '):
+                i=i+1
+            return line[i:].split(b'\t')[0]
+    return "Linux"
+        
+
+def addEFIEntry():
+    if exists(DATADIR + "bootmgrcdm"):
+        return
+    efidevice = findEFIDevice()
+    part = efidevice[-1]
+    if part<ord('0') or part>ord('9'):
+        error("Can't find partition on "+efidevice)
+
+    bootOptionName = findCurrentBootOptionName();
+    if bootOptionName.find(b"Bytelocker")==-1:
+         bootOptionName+=b" Bytelocker"
+
+    bootcmd = "efibootmgr --create --disk /dev/"+efidevice.decode()+" --part "+ part.to_bytes(1,'big').decode()  +" --label \"" +bootOptionName.decode()+ "\" --loader \"" +  unix_to_windows_path(EFIFILE) + "\" --verbose"; 
+    command_nopipe(bootcmd)
+    writefile(DATADIR + "bootmgrcdm",bootcmd.encode())
+    return
+
+def choseAlg():
+    res = command("tpm2_pcrread sha256:4")
+    global alg
+    if res.find(b" 0x")!=-1:
+        alg='sha256'
+        return
+    res = command("tpm2_pcrread sha1:4")
+    if res.find(b" 0x")!=-1:
+        alg='sha1'
+        return
+    error("Can't access TPM2\nPlease make sure, TPM is enabled in your BIOS setup")
+    return
+
+def setup2(estimate):
+    alloc_persistent_address(True)
+    
+    #estimate PCR values after update
+#    if estimate==True:
+#        retval = command("tpm2_pcrread -o "+DATADIR+"pcr.bin "+alg+":0,2") 
+#        buf = readfile(DATADIR+"pcr.bin") + getpcr4()   #pcr4 is calculated from the EFI image
+#        writefile(DATADIR+"pcr.bin",buf) 
+#    else:
+#       retval = command("tpm2_pcrread -o "+DATADIR+"pcr.bin "+alg+":0,2,4") 
+    retval = command("tpm2_pcrread -o "+DATADIR+"pcr.bin "+alg+":0,2,4") 
+    
+    #delete handle if exists
+    ret = command("tpm2_getcap handles-persistent")
+    if ret.find(persistent_address)!=-1:
+        command("tpm2_evictcontrol -C o -c "+persistent_address.decode())
+    
+    #upload  /crypto_keyfile_bytelocker.bin to TPM with the calculated PCRs
+    command("tpm2_createprimary -c " +DATADIR+ "primary.ctx -Q")
+    pcroptions = " --pcr "+DATADIR+"pcr.bin"
+    if args.a:
+        pcroptions = ""
+    command("tpm2_createpolicy -Q --policy-pcr --pcr-list " + alg + ":0,2,4 --policy " + DATADIR + "pcr.policy" + pcroptions)
+    command("tpm2_create -C " +DATADIR + "primary.ctx -L " +  DATADIR+ "pcr.policy -u " +  DATADIR +  "seal.pub -r " +  DATADIR +  "seal.priv -Q --sealing-input "+LUKSKEY)
+    command("tpm2_load -C "+ DATADIR +  "primary.ctx -u " +DATADIR+ "seal.pub -r " +DATADIR+ "seal.priv -c " + DATADIR+ "seal.ctx -Q")
+    res = command("tpm2_evictcontrol --object-context " +  DATADIR+  "seal.ctx --hierarchy o --output " + DATADIR +  "evict.dat "+persistent_address.decode())
+    if res.find(persistent_address)==-1 or res.find(b"persisted")==-1:
+        error("Error uploading to TPM")
+
+    cleanup()
+    print ("\n\nBytelocker done.")
+
+def mainsetup():
+    mkdirsafe("/var/lib/bytelocker")
+    findDevice()
+    alloc_persistent_address(False)
+    print("Persistent handle: "+persistent_address.decode())
+
+    addBytelockerKey()
+
+    if distro=="dracut":
+        installhooks_dracut()
+        mkdirsafe("/boot/efi/EFI/BYTELOCKER")
+        addEFIEntry()
+
+
+    if distro=="ubuntu":
+        patch_crypttab_ubuntu()
+        installhooks_ubuntu()
+        mkdirsafe("/boot/efi/EFI/BYTELOCKER")
+        print("Updating initramfs")
+        command_nopipe("update-initramfs -u")
+        cleanup()
+        addEFIEntry()
+
+
+    if distro=="arch":
+        patch_mkinitcpio_conf_arch()
+        installhooks_arch()
+        mkdirsafe("/boot/efi/EFI/BYTELOCKER")
+        print("Updating initramfs")
+        findkernel_and_initramfs(False)
+        command_nopipe("mkinitcpio -g "+initrd_no_ucode)
+        cleanup()
+        addEFIEntry()
+        setup2(True)
+
+
+#entrypoint
+checkdeps()
+
+
+#testing
+#choseAlg()
+#buildefi()
+#pcr4 = getpcr4()
+#print(binascii.hexlify(pcr4).decode())
+#exit()
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-v", action="store_true", help="show executed commands")
+#parser.add_argument("setup",help="Set up automatic unlocking of root LUKS volume")
+parser.add_argument('command',choices=['setup','buildefi','printpcr','fixpcr'])
+parser.add_argument("-a",action="store_true",help="Do not calculate expected PCRS, use actual")
+parser.add_argument("--kernelname",type=str,help="specify the suffix of kernel and initrd filenames for buildefi command")
+args = parser.parse_args()
+#verbose = args.v     # defaulting to verbose
+
+choseAlg()
+
+
+# if args.command=='printpcr':
+#     pcr4 = getpcr4()
+#     print(binascii.hexlify(pcr4).decode())
+#     exit(0)
+
+
+if args.command=='setup':
+    mainsetup()
+
+if args.command=='buildefi':  #should be called only from the post update hook by update-initramfs
+    print("building custom EFI image")
+    buildefi()
+    print("Uploading and sealing LUKS key with estimated PCR values")
+    setup2(True)
+
+if args.command=='fixpcr':
+    setup2(False)

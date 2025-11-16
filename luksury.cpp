@@ -35,6 +35,7 @@ ESYS_CONTEXT *g_esys_ctx = nullptr;
 std::vector<std::string> errors;
 std::string root_device_name;
 std::string root_device_uuid;
+std::string root_partition_name;
 TPML_PCR_SELECTION pcrSelection;
 int verbosity = 1;
 
@@ -160,7 +161,42 @@ public:
         }
         return *this;
     }
-    };
+};
+
+std::vector<unsigned char> loadFile(std::string path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        adderror(std::string("can't read file " + path ));
+        return {};
+    }
+
+    // Get file size
+    file.seekg(0, std::ios::end);
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Read file content
+    std::vector<unsigned char> buffer(size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        adderror(std::string("can't read file " + path ));
+        return {};
+    }
+    file.close();
+    return buffer;
+}
+
+bool saveFile(std::string path, std::string content)
+{
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        adderror(std::string("can't write to file " + path ));
+        return false;
+    }
+    file << content;
+    file.close();
+    return true;
+}
 
 ESYS_CONTEXT *tss_esys_context() {
     ESYS_CONTEXT *ctx = nullptr;
@@ -322,14 +358,63 @@ TPM2B_DIGEST concatenated_to_digest(const std::vector<uint8_t>& pcrConcatenated)
     return digest;
 }
 
+bool evict_persistent( TPM2_HANDLE persistent_handle) {
+    ESYS_CONTEXT* esys = g_esys_ctx;
+    TSS2_RC rc;
 
-int seal_secret_to_persistent(
+    // Prepare a session: usually password session with TPM2_RH_OWNER
+    ESYS_TR session = ESYS_TR_NONE;
+
+    // Auth: owner hierarchy has to authorize the eviction
+    rc = Esys_TR_SetAuth(esys, ESYS_TR_RH_OWNER, nullptr);
+    if (rc != TSS2_RC_SUCCESS) {
+        return false;
+    }
+
+    // Before you can evict, you must get an ESYS_TR for the persistent handle
+    ESYS_TR persistent_tr = ESYS_TR_NONE;
+    rc = Esys_TR_FromTPMPublic(
+        esys,
+        persistent_handle,
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
+        &persistent_tr
+    );
+    if (rc != TSS2_RC_SUCCESS) {
+        return false;
+    }
+
+    ESYS_TR out_tr = ESYS_TR_NONE;
+
+    rc = Esys_EvictControl(
+        esys,
+        ESYS_TR_RH_OWNER,     // authorizing hierarchy
+        persistent_tr,        // object to evict
+        ESYS_TR_PASSWORD,     // auth session
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
+        persistent_handle,    // persistent handle to remove
+        &out_tr
+    );
+
+    if (rc != TSS2_RC_SUCCESS) {
+        return false;
+    }
+
+    // Clean up
+    Esys_TR_Close(esys, &persistent_tr);
+    Esys_TR_Close(esys, &out_tr);
+    return true;
+}
+
+
+bool seal_secret_to_persistent(
     uint32_t persistentHandle,
     const std::vector<uint8_t>& password,
     const TPML_PCR_SELECTION &pcrSelection,
     const std::vector<uint8_t>& pcrConcatenated)
     {
-    
     
     auto digest = concatenated_to_digest(pcrConcatenated);
     
@@ -543,7 +628,7 @@ int seal_secret_to_persistent(
         return false;
     }
     
-    std::cout << "Password successfully sealed with PCR values!" << std::endl;
+    std::cout << "Keyfile successfully sealed with PCR values!" << std::endl;
     std::cout << "Persistent handle: 0x" << std::hex << persistentHandle << std::dec << std::endl;
     
     // Cleanup
@@ -667,118 +752,76 @@ std::vector<std::string> split(const std::string& str) {
     return tokens;
 }
 
-bool editCrypttab(const std::string& uuid, bool dry_run) {
-    const std::string keyscriptParam = "keyscript=/var/lib/luksury/luksury_initrd.sh";
-    const std::string crypttabPath = "/etc/crypttab";
+
+std::vector<std::string> checkCrypttabForKeyfiles() {
+    std::vector<std::string> keyfiles;
+    std::ifstream file("/etc/crypttab");
     
-    // Read the file
-    std::ifstream inFile(crypttabPath);
-    if (!inFile.is_open()) {
-        std::cerr << "Error: Cannot open " << crypttabPath << std::endl;
-        return false;
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open /etc/crypttab" << std::endl;
+        return keyfiles;
     }
     
-    std::vector<std::string> lines;
     std::string line;
-    bool foundAndModified = false;
+    int line_number = 0;
     
-    while (std::getline(inFile, line)) {
-        std::string trimmedLine = trim(line);
+    while (std::getline(file, line)) {
+        line_number++;
         
-        // Preserve empty lines and comments
-        if (trimmedLine.empty() || trimmedLine[0] == '#') {
-            lines.push_back(line);
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') {
             continue;
         }
-
-        if (line.find("keyfile")!=std::string::npos)
-        {
-            adderror("/etc/crypttab contains keyfiles. These are unsafe, because they are stored in the initramfs.");
-            return false;
-        }
         
-        // Parse the line
-        std::vector<std::string> cols = split(trimmedLine);
+        std::istringstream iss(line);
+        std::string target, source, keyfile, options;
         
-        // crypttab format: <name> <device> <password> <options>
-        // We need at least 2 columns (name and device)
-        if (cols.size() >= 2) {
-            // Check if this line contains the UUID
-            if (cols[1].find(uuid) != std::string::npos) {
-                // Ensure we have 4 columns
-                while (cols.size() < 4) {
-                    cols.push_back("-");
+        // Parse the four fields: target source keyfile options
+        if (iss >> target >> source >> keyfile >> options) {
+            // Check if keyfile field is not "none" or "-"
+            if (!keyfile.empty() && keyfile != "none" && keyfile != "-") {
+                // Check if it's an actual file path (not a password prompt)
+                if (keyfile.find("/") != std::string::npos || 
+                    keyfile.find(".key") != std::string::npos) {
+                    keyfiles.push_back(keyfile);
+                    std::cout << "Found keyfile reference on line " << line_number 
+                              << ": " << keyfile << std::endl;
                 }
-                
-                // Check if keyscript is already in the 4th column
-                if (cols[3].find("keyscript=") == std::string::npos) {
-                    // Add keyscript parameter
-                    if (cols[3] == "-" || cols[3] == "none") {
-                        cols[3] = keyscriptParam;
-                    } else {
-                        cols[3] += "," + keyscriptParam;
-                    }
-                    foundAndModified = true;
-                }
-                
-                // Reconstruct the line
-                std::ostringstream oss;
-                for (size_t i = 0; i < cols.size(); ++i) {
-                    if (i > 0) oss << " ";
-                    oss << cols[i];
-                }
-                lines.push_back(oss.str());
-            } else {
-                lines.push_back(line);
             }
-        } else {
-            lines.push_back(line);
+            
+            // Also check options field for keyfile specifications
+            if (!options.empty()) {
+                // Look for keyfile= option
+                size_t keyfile_pos = options.find("keyfile=");
+                if (keyfile_pos != std::string::npos) {
+                    size_t start = keyfile_pos + 8; // "keyfile=" is 8 chars
+                    size_t end = options.find(",", start);
+                    std::string keyfile_path;
+                    
+                    if (end == std::string::npos) {
+                        keyfile_path = options.substr(start);
+                    } else {
+                        keyfile_path = options.substr(start, end - start);
+                    }
+                    
+                    if (!keyfile_path.empty()) {
+                        keyfiles.push_back(keyfile_path);
+                        std::cout << "Found keyfile in options on line " << line_number 
+                                  << ": " << keyfile_path << std::endl;
+                    }
+                }
+            }
         }
     }
-    inFile.close();
     
-    if (!foundAndModified) {
-        std::cerr << "Warning: UUID " << uuid << " not found or keyscript already present" << std::endl;
-        return false;
+    file.close();
+    
+    if (keyfiles.empty()) {
+    } else {
+        std::cout << "Total keyfile references found: " << keyfiles.size() << std::endl;
     }
     
-    // Get original file permissions
-    struct stat fileStat;
-    if (stat(crypttabPath.c_str(), &fileStat) != 0) {
-        std::cerr << "Error: Cannot get file permissions" << std::endl;
-        return false;
-    }
-    
-    // Write to temporary file
-    std::string tempPath = crypttabPath + ".tmp";
-    std::ofstream outFile(tempPath);
-    if (!outFile.is_open()) {
-        std::cerr << "Error: Cannot create temporary file" << std::endl;
-        return false;
-    }
-    
-    for (const auto& l : lines) {
-        outFile << l << "\n";
-    }
-    outFile.close();
-    
-    // Set same permissions on temp file
-    if (chmod(tempPath.c_str(), fileStat.st_mode) != 0) {
-        std::cerr << "Error: Cannot set permissions on temporary file" << std::endl;
-        remove(tempPath.c_str());
-        return false;
-    }
-    
-    // Atomically replace original file
-    if (!dry_run)
-    if (rename(tempPath.c_str(), crypttabPath.c_str()) != 0) {
-        std::cerr << "Error: Cannot replace original file" << std::endl;
-        remove(tempPath.c_str());
-        return false;
-    }
-    
-    if (!dry_run) std::cout << "Successfully added keyscript parameter for UUID " << uuid << std::endl;
-    return true;
+    return keyfiles;
 }
 
 
@@ -919,6 +962,7 @@ std::string exec_with_input(const std::string& command, const std::string& input
 std::string findRootDevice(const Json::Value& device, const std::string& currentName = "") {
     // Check if this device is mounted at /
     if (device.isMember("mountpoint") && device["mountpoint"].asString() == "/") {
+        root_partition_name = device["name"].asString();
         return currentName;
     }
     
@@ -1077,7 +1121,11 @@ void system_checks()
         adderror("Failed to find root partition details.");
     }
 
-    editCrypttab(root_device_uuid,true);
+    auto res = checkCrypttabForKeyfiles();
+    if (res.empty()==false)
+    {
+        adderror("/etc/crypttab contains keyfiles, which are included in the initRAMFS. The initRAMFS is not ecrypted when using systemd-boot.");
+    }
 }
 
 bool extra_luks_key_setup()
@@ -1147,10 +1195,11 @@ bool extra_luks_key_setup()
         adderror("Failed to add root keyfile to LUKS header");
         return false;
     }
+    return true;
 }
 
 
-bool getTPMHandleAddress()
+bool getTPMHandleAddress(bool only_from_file)
 {
     std::ifstream inFile(DATA_DIR "/persistent_handle.bin");
     if (inFile.is_open()) {
@@ -1158,8 +1207,17 @@ bool getTPMHandleAddress()
     }
     else
     {
+        if (only_from_file)
+        {
+            adderror("NVRAM address hasn't been assigned. Have you run setup?");
+            return false;
+        }
         persistent_handle.handle = find_free_handle();
-        TPM2_HANDLE  find_free_handle();
+        if  (persistent_handle.handle==0)
+        {
+            adderror("Could not find a free slot in NVRAM");
+            return false;
+        }
         std::ofstream outFile(DATA_DIR "/persistent_handle.bin");
         if (!outFile.is_open()) {
             adderror("Failed to write persistent handle to file");
@@ -1171,8 +1229,56 @@ bool getTPMHandleAddress()
     return true;
 }
 
+
+
+#define DRACUT_PATH "/usr/lib/dracut/modules.d/89luksury"
+
+bool install_hooks()
+{
+    if (!is_dracut_available()) return false;
+
+    auto retriever = 
+    std::string(
+        "#!/usr/bin/bash\n"
+        "    echo Luksury is unsealing root encryption key\n"
+        "    echo 'luksury is unsealing root encryption key' >> /run/initramfs/luksury.txt\n"
+        "    modprobe -a -q tpm_crb >/dev/null 2>&1\n"
+        "    tpm2_unseal -c ")+persistent_handle.text+" -p pcr:sha256:"+pcr_list_to_string(pcr_list)+" -o /run/cryptsetup-keys.d/" + root_partition_name + ".key >/dev/null 2>&1\n"
+        "if [ ! -f \"/run/cryptsetup-keys.d/" + root_partition_name + ".key\" ]\n"
+        " then\n"
+        " echo Luksury could not decrypt system volume automatically\n"
+        " echo Luksury could not decrypt system volume automatically\n >> /run/initramfs/luksury.txt\n"
+        " echo\n"
+        " echo\n"
+        " fi\n";
+    
+    mkdir(DRACUT_PATH,0755);
+    if (!saveFile(DRACUT_PATH "/luksury_retrieve.sh",retriever)) return false;
+
+    auto installer = (
+        "#!/bin/bash\n"
+        "check() {\n"
+        "    return 0\n"
+        "}\n"
+        "depends() {\n"
+        "    return 0\n"
+        "}\n"
+        "install() {\n"
+        "   inst_multiple tpm2_unseal" 
+        "   inst_libdir_file \"libtss2-tct-device.so*\""
+        "   inst_hook cmdline 10 \"$moddir/luksury_retrieve.sh\"\n"
+        "}\n"
+        );
+    if (!saveFile(DRACUT_PATH "/module-setup.sh", installer)) return false;
+
+    std::cout << "initRAMFS hook for retrieving key from TPM2 installed\n";
+
+    return true;
+}
+
 bool initial_setup()
 {
+    find_root_partition_data();
     system_checks();
     if (errors.size()) return false;
 
@@ -1180,11 +1286,9 @@ bool initial_setup()
 
     if (!extra_luks_key_setup()) return false;
 
-    if (editCrypttab(root_device_uuid,false)==false) return false;
+    if (!getTPMHandleAddress(false)) return false;
 
-    if (!getTPMHandleAddress()) return false;
-
-    // install hooks
+    if (!install_hooks()) return false;
 
     // regen initramfs
 
@@ -1201,22 +1305,65 @@ bool predictpcrs()
     main_pcr_oracle(6, (args));
     if (predicted_pcr_conc.size()!=pcr_list.size() * SHA256_DIGEST_LENGTH)
     {
-        adderror("PCR prediction failed.");
+//        adderror("PCR prediction failed.");
+        std::cout << "Warning: pcr prediction failed.\n";
         return false;
     }
     return true;
 }
 
 
-//todo: test luks optimizer, save persistent handle slot, install hooks
-
 bool update_pcrs()
 {
+    auto current_pcr_values = retrieve_current_pcr_values_concat(pcrSelection);
+    if (!predictpcrs())
+    {
+        std::cout << "using current PCRs\n";
+        predicted_pcr_conc = current_pcr_values;
+    }
+    if (current_pcr_values != predicted_pcr_conc)
+    {
+        std::cout << "predicted PCR values do not match current (system may have been updates)\n";
+    }
+    else
+    {
+        std::cout << "predicted PCR values = current\n";
+    }
+
+    if (!getTPMHandleAddress(true)) return false;
+
+    auto rootkey = loadFile( ROOT_KEY_FILE );
+    if (rootkey.size()!=32)
+    {
+        adderror("Can't access stored keyfile. Have you run setup?");
+        return false;
+    }
+
+    evict_persistent(persistent_handle.handle);
+
+    if (!seal_secret_to_persistent( persistent_handle.handle, rootkey, pcrSelection, predicted_pcr_conc))
+    {
+        adderror("TPM keyfile PCR update failed.");
+    }
+
+    Esys_Finalize(&g_esys_ctx);
+    return true;
 }
+
 
 
 int main(int argc, char* argv[])
 {
+    // commands: --help, setup, remove, update
+    if (argc !=2) {
+        std::cout << "Usage: " << argv[0] << " [setup|remove|update]" << std::endl;
+        std::cout << "\nLUKSury is a utility, which adds a generated key to the root file system LUKS partition, and automatically unlocks the voluime without the need to enter password.\n";
+        std::cout << "The generated key is stored in TPM2 device, and can be unsealed only when measured boot PCR values match the expected values.\n";
+        std::cout << "LUKSury automatically precomputes the PCR values after system updates, or by invoking \"sudo luksury update\"\n";
+        std::cout << "only your default kernel option, found at /boot/vmlinuz will boot without password prompt.\n";
+        return 1;
+    }
+
     if (getuid() != 0) 
     {
         adderror("You need to be root to run this program.");
@@ -1229,15 +1376,28 @@ int main(int argc, char* argv[])
         return 1;
     }
     init_pcr_selection(pcrSelection, pcr_list);
-    find_root_partition_data();
 
-    initial_setup();
+
+    std::string command = argv[1];
+    if (command == "setup") {
+        return initial_setup();
+    } else if (command == "remove") {
+        // Implement remove functionality
+        std::cout << "Remove functionality not implemented yet" << std::endl;
+        return 1;
+    } else if (command == "update") {
+        return update_pcrs();
+    } else {
+        std::cout << "Unknown command: " << command << std::endl;
+        return 1;
+    }
     return 0;
+}
+int part2() {    
+
 
 
     predictpcrs();
-
-
     auto current_pcr_concat = retrieve_current_pcr_values_concat(pcrSelection);
 
     std::cout<<"size: " << predicted_pcr_conc.size() << " data:" << std::hex << std::setfill('0') << std::setw(2);
@@ -1258,7 +1418,6 @@ int main(int argc, char* argv[])
     seal_secret_to_persistent( handle, {'h','e','l','l','o',0}, pcrSelection, predicted_pcr_conc);
 //    delete_persistent_handle(handle);
 
-    Esys_Finalize(&g_esys_ctx);
     if (errors.size())
     {
         for (const auto& err : errors) {
