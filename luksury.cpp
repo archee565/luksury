@@ -47,7 +47,7 @@ struct {
 
 
 #define ZERO(x) memset(&x,0, sizeof(x))
-bool update_pcrs();
+int update_pcrs();
 
 void adderror(const std::string& msg)
 {
@@ -415,7 +415,7 @@ bool evict_persistent( TPM2_HANDLE persistent_handle) {
     }
 
     // Clean up
-    Esys_TR_Close(esys, &persistent_tr);
+//    Esys_TR_Close(esys, &persistent_tr);
     return true;
 }
 
@@ -441,7 +441,7 @@ bool seal_secret_to_persistent(
                                 ESYS_TR_NONE, ESYS_TR_NONE,
                                 ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
                                 NULL,
-                                TPM2_SE_POLICY,
+                                TPM2_SE_TRIAL,
                                 &symmetric,
                                 TPM2_ALG_SHA256,
                                 &policySessionPCR);
@@ -639,8 +639,7 @@ bool seal_secret_to_persistent(
         return false;
     }
     
-    std::cout << "Keyfile successfully sealed with PCR values!" << std::endl;
-    std::cout << "Persistent handle: 0x" << std::hex << persistentHandle << std::dec << std::endl;
+    std::cout << "Auto unlock-key successfully sealed with PCR values. Persistent handle: 0x" << std::hex << persistentHandle << std::dec << std::endl;
     
     // Cleanup
     Esys_FlushContext(g_esys_ctx, loadedHandle);
@@ -748,7 +747,8 @@ std::vector<std::string> split(const std::string& str) {
 
 
 
-bool modifyCrypttab(const std::string& deviceName, bool dryrun) {
+bool modifyCrypttab(bool dryrun) {
+    std::string deviceName = root_partition_name;
     const std::string& crypttabPath = "/etc/crypttab";
     std::ifstream inFile(crypttabPath);
     if (!inFile.is_open()) {
@@ -1112,14 +1112,14 @@ void system_checks()
     if (getFileSize("/boot/initrd.img")<1) adderror("Can't access /boot/initrd.img");
     if (getFileSize("/boot/vmlinuz")<1) adderror("Can't access /boot/vmlinuz");
 
-    if (predictpcrs()==false) adderror("PCR prediction doesn't work.");
+//    if (predictpcrs()==false) adderror("PCR prediction doesn't work."); // can't call  twice
 
     if (root_device_name.empty() || root_device_uuid.empty())
     {
         adderror("Failed to find root partition details.");
     }
 
-    if (modifyCrypttab(root_device_name,true)==false)
+    if (modifyCrypttab(true)==false)
     {
         adderror("Can't modify /etc/crypttab");
     }
@@ -1199,18 +1199,6 @@ bool extra_luks_key_setup()
         return false;
     }
 
-    modifyCrypttab(root_device_name,false);
-    std::cout << "/etc/crypttab updated.\n";
-
-    if (getFileSize("/usr/sbin/update-initramfs")!=0)
-    {
-        int res = system("/usr/sbin/update-initramfs -u");
-        return update_pcrs();
-    }
-    else
-    {
-        std::cout << "\nTo complete setup, please regenerate initRAMFS, then run \"sudo luksury update\"\n";
-    }
     return true;
 }
 
@@ -1261,8 +1249,8 @@ bool install_hooks()
         "modprobe -a -q tpm_crb >/dev/null 2>&1\n"
         "tpm2_pcrread >>/run/initramfs/log/luksury.log\n"
         "tpm2_unseal -c ")+persistent_handle.text+" -p pcr:sha256:"+pcr_list_to_string(pcr_list)+" -o /root.key>>/run/initramfs/log/luksury.log 2>&1\n"
-        "tpm2_pccnd 15:sha256=6666666666666666666666666666666666666666666666666666666666666666\n"
-        "if [ ! -f \"/root.key/\" ]\n"
+        "tpm2_pcrextend 15:sha256=6666666666666666666666666666666666666666666666666666666666666666\n"
+        "if [ ! -f \"/root.key\" ]\n"
         " then\n"
         " echo Luksury could not decrypt system volume automatically\n"
         " echo Luksury could not decrypt system volume automatically >> /run/initramfs/log/luksury.log\n"
@@ -1291,6 +1279,23 @@ bool install_hooks()
 
     std::cout << "initRAMFS hook for retrieving key from TPM2 installed\n";
 
+    std::string no_emergency_shell = "omit_dracutmodules+=\" debug rescue \"\n";
+    if  (saveFile("/usr/lib/dracut/dracut.conf.d/80-luksury.conf",no_emergency_shell,0x644)) 
+    {
+        std::cout << "Emergency shells disabled\n";
+    }
+
+    return true;
+}
+
+bool install_auto_update()
+{
+    std::string updatecommand = "#!/bin/sh\nluksury update\n";
+    if (!saveFile("/etc/initramfs/post-update.d/zzz-luksury",updatecommand,0755))
+    {
+        // ubuntu failed, try arch
+        return false;
+    }
     return true;
 }
 
@@ -1308,9 +1313,23 @@ bool initial_setup()
 
     if (!install_hooks()) return false;
 
-    // regen initramfs
+    if (!modifyCrypttab(false)) return false;
 
-    // update pcrs -> replace kernel and initrd files
+    if (!install_auto_update())
+    {
+        std::cout << "Warning: Failed to install auto update for initrd or kernel updates\n";
+    }
+
+    if (getFileSize("/usr/sbin/update-initramfs")!=0)
+    {
+        int res = system("/usr/sbin/update-initramfs -u");
+        return true;
+//        return update_pcrs();
+    }
+    else
+    {
+        std::cout << "\nTo complete setup, please regenerate initRAMFS, then run \"sudo luksury update\"\n";
+    }
 
     return true;
 }
@@ -1325,15 +1344,16 @@ bool predictpcrs()
     {
 //        adderror("PCR prediction failed.");
         std::cout << "Warning: pcr prediction failed.\n";
-        return false;
+//        return false;
     }
     return true;
 }
 
 
-bool update_pcrs()
+int update_pcrs()
 {
     auto current_pcr_values = retrieve_current_pcr_values_concat(pcrSelection);
+    std::cout << "luksury is updating PCR values for auto-unlocking\n";
     if (!predictpcrs())
     {
         std::cout << "using current PCRs\n";
@@ -1341,20 +1361,20 @@ bool update_pcrs()
     }
     if (current_pcr_values != predicted_pcr_conc)
     {
-        std::cout << "predicted PCR values do not match current (system may have been updates)\n";
+        std::cout << "predicted PCR values do not match current (system may have been updated)\n";
     }
     else
     {
         std::cout << "predicted PCR values = current\n";
     }
 
-    if (!getTPMHandleAddress(true)) return false;
+    if (!getTPMHandleAddress(true)) return 1;
 
     auto rootkey = loadFile( ROOT_KEY_FILE );
     if (rootkey.size()!=32)
     {
         adderror("Can't access stored keyfile. Have you run setup?");
-        return false;
+        return 1;
     }
 
     std::vector<TPM2_HANDLE> handles = get_tpm_persistent_handles();
@@ -1368,7 +1388,7 @@ bool update_pcrs()
     }
 
     Esys_Finalize(&g_esys_ctx);
-    return true;
+    return 0;
 }
 
 
