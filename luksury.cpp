@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <termios.h>
 #include <sys/stat.h>
 #include <memory>
 #include <filesystem>
@@ -15,11 +16,13 @@
 #include <functional>
 #include <unistd.h>
 #include <jsoncpp/json/json.h>  // Requires jsoncpp library
+namespace fs = std::filesystem;
 
 #include <openssl/sha.h>  
 #include <tss2/tss2_esys.h>
 #include <tss2/tss2_mu.h>
 #include <tss2/tss2_rc.h>
+
 
 /*
 Checklist: 
@@ -31,6 +34,13 @@ Checklist:
 std::vector<int> pcr_list = {0,1,2,4,5,7,9,15};
 #define DATA_DIR "/var/lib/luksury"
 #define ROOT_KEY_FILE DATA_DIR "/root_keyfile.bin"
+#define DRACUT_PATH "/usr/lib/dracut/modules.d/89luksury"
+
+struct PERSISTENT_HANDLE {
+    char text[16];
+    TPM2_HANDLE handle;
+} ;
+PERSISTENT_HANDLE persistent_handle;
 ESYS_CONTEXT *g_esys_ctx = nullptr;
 std::vector<std::string> errors;
 std::string root_device_name;
@@ -39,15 +49,14 @@ std::string root_partition_name;
 TPML_PCR_SELECTION pcrSelection;
 int verbosity = 1;
 
-struct {
-    char text[16];
-    TPM2_HANDLE handle;
-} persistent_handle;
 
-
+const char *root_key_file = ROOT_KEY_FILE;
+const char *dracut_path = DRACUT_PATH;
+const char *data_dir = DATA_DIR;
 
 #define ZERO(x) memset(&x,0, sizeof(x))
 int update_pcrs();
+bool remove_luksury();
 
 void adderror(const std::string& msg)
 {
@@ -692,11 +701,20 @@ std::vector<uint8_t> retrieve_current_pcr_values_concat(TPML_PCR_SELECTION pcr_s
         std::cerr << "Esys_PCR_Read failed: 0x" << std::hex << rc << std::endl;
         return {};
     }
-
+    
+    // PCR 15 is extended by garbage right after unsealing to prevent unsealing a second time
     // Copy PCR values to output vector
     for (int i = 0; i < pcr_digest->count; ++i) {
-        for(int j=0;j<pcr_digest->digests[i].size;j++)
-            pcr_values.push_back(pcr_digest->digests[i].buffer[j]);
+        if (pcr_list[i]==15)
+        {
+            for(int j=0;j<pcr_digest->digests[i].size;j++)
+                pcr_values.push_back(0);
+        }
+        else
+        {
+            for(int j=0;j<pcr_digest->digests[i].size;j++)
+                pcr_values.push_back(pcr_digest->digests[i].buffer[j]);
+        }
     }
 
     // Clean up
@@ -1044,7 +1062,6 @@ std::uintmax_t getFileSize(const std::string& filepath) {
     }
 }
 
-namespace fs = std::filesystem;
 
 bool is_dracut_available() {
     // Check if dracut executable exists in common locations
@@ -1131,6 +1148,26 @@ void system_checks()
     // }
 }
 
+std::string getPassword(const std::string& prompt = "Enter password: ") {
+    std::cout << prompt;
+    
+    std::string password;
+    
+    // Linux/Unix implementation
+    termios oldt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    termios newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    
+    std::getline(std::cin, password);
+    
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    
+    std::cout << std::endl;
+    return password;
+}
+
 bool extra_luks_key_setup()
 {
     if (getFileSize(ROOT_KEY_FILE)==32)
@@ -1139,9 +1176,10 @@ bool extra_luks_key_setup()
         return true;
     }
 
-    std::cout << "Enter passphrase for /dev/" << root_device_name << std::endl;
+    std::cout << "Enter passphrase for /dev/" << root_device_name << " : ";
 
-    Tempfile passwdfile = Tempfile("a");
+    std::string password = getPassword();
+    Tempfile passwdfile = Tempfile(password);
 
     std::string command = "cryptsetup luksOpen --test-passphrase /dev/"+root_device_name+" --key-file "+passwdfile.get_path()+" --verbose";
 
@@ -1235,7 +1273,6 @@ bool getTPMHandleAddress(bool only_from_file)
 
 
 
-#define DRACUT_PATH "/usr/lib/dracut/modules.d/89luksury"
 
 bool install_hooks()
 {
@@ -1298,6 +1335,7 @@ bool install_auto_update()
     }
     return true;
 }
+
 
 bool initial_setup()
 {
@@ -1401,7 +1439,7 @@ int main(int argc, char* argv[])
         std::cout << "\nLUKSury is a utility, which adds a generated key to the root file system LUKS partition, and automatically unlocks the voluime without the need to enter password.\n";
         std::cout << "The generated key is stored in TPM2 device, and can be unsealed only when measured boot PCR values match the expected values.\n";
         std::cout << "LUKSury automatically precomputes the PCR values after system updates, or by invoking \"sudo luksury update\"\n";
-        std::cout << "only your default kernel option, found at /boot/vmlinuz will boot without password prompt.\n";
+        std::cout << "Only your default kernel option,will boot without password prompt.\n";
         return 1;
     }
 
@@ -1423,9 +1461,7 @@ int main(int argc, char* argv[])
     if (command == "setup") {
         return initial_setup();
     } else if (command == "remove") {
-        // Implement remove functionality
-        std::cout << "Remove functionality not implemented yet" << std::endl;
-        return 1;
+        return remove_luksury();
     } else if (command == "update") {
         return update_pcrs();
     } else {

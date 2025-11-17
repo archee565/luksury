@@ -123,7 +123,7 @@ bool restoreCrypttab() {
 
 bool remove_luks_key() {
     if (getFileSize(root_key_file)==0) {
-        std::cout << "Note: Root keyfile not found or invalid. Skipping LUKS key removal." << std::endl;
+        std::cout << "Note: Root keyfile not found. Skipping LUKS key removal." << std::endl;
         return true;
     }
     std::cout << "Removing auto-unlock key from LUKS header..." << std::endl;
@@ -263,7 +263,7 @@ bool cleanup_data_directory() {
 }
 
 bool remove_luksury() {
-    std::cout << "=== Removing Luksury Auto-Unlock Configuration ===" << std::endl;
+    std::cout << "=== Removing Luksury Auto-Unlock  ===" << std::endl;
     std::cout << std::endl;
 
     // Find root partition data
@@ -318,13 +318,11 @@ bool remove_luksury() {
     std::cout << "\n=== Removal Process Complete ===" << std::endl;
     
     if (all_success) {
-        std::cout << "\nLuksury has been successfully removed from your system." << std::endl;
-        std::cout << "Please regenerate your initRAMFS to complete the removal:" << std::endl;
         if (fs::exists("/usr/sbin/update-initramfs")) {
-            std::cout << "  sudo update-initramfs -u" << std::endl;
-        } else {
-            std::cout << "  sudo dracut --force" << std::endl;
+//            std::cout << "  sudo update-initramfs -u" << std::endl;
+            int res = system("/usr/sbin/update-initramfs -u");
         }
+        std::cout << "\nLuksury has been successfully removed from your system." << std::endl;
         std::cout << "\nAfter the next boot, you will need to enter your password to unlock the root partition." << std::endl;
     } else {
         std::cout << "\nRemoval completed with warnings. Please check the messages above." << std::endl;
