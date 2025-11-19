@@ -198,11 +198,11 @@ std::vector<unsigned char> loadFile(std::string path)
 
 bool saveFile(const std::string& path,
               const std::string& content,
-              mode_t mode = 0)       // optional octal permissions, 0 = skip
+              mode_t mode = 0, bool showerrors=true)       // optional octal permissions, 0 = skip
 {
     std::ofstream file(path);
     if (!file.is_open()) {
-        adderror("can't write to file " + path);
+        if (showerrors) adderror("can't write to file " + path);
         return false;
     }
 
@@ -808,6 +808,7 @@ bool modifyCrypttab(bool dryrun) {
             }
             
             lines.push_back(oss.str());
+            if (!dryrun)
             std::cout << "Modified entry for device: " << deviceName << std::endl;
         } else {
             lines.push_back(line);
@@ -1054,7 +1055,7 @@ bool create_folder(const std::string& folderPath) {
     }
 }        
 
-std::uintmax_t getFileSize(const std::string& filepath) {
+int getFileSize(const std::string& filepath) {
     try {
         return std::filesystem::file_size(filepath);
     } catch (const std::filesystem::filesystem_error& e) {
@@ -1124,12 +1125,23 @@ BootLoader check_bootloader() {
 
 bool predictpcrs();
 
+bool checkTpm2Tools() {
+    std::string command = "which tpm2_getrandom tpm2_pcrread >/dev/null 2>&1";
+    int result = system(command.c_str());
+    return (result == 0);
+}
+
 void system_checks()
 {
     if (getuid() != 0) 
     {
         adderror("You need to be root to run this program.");
         return;
+    }
+
+    if (!checkTpm2Tools())
+    {
+        adderror("tpm2 tools must be installed");
     }
 
     if (!is_dracut_available() || !has_dracut_config())
@@ -1140,9 +1152,6 @@ void system_checks()
     if (check_bootloader()!=BootLoader::SYSTEMD_BOOT) adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
 
     if (retrieve_current_pcr_values_concat(pcrSelection).empty()) adderror("Can't access TPM2");
-
-    if (getFileSize("/boot/initrd.img")<1) adderror("Can't access /boot/initrd.img");
-    if (getFileSize("/boot/vmlinuz")<1) adderror("Can't access /boot/vmlinuz");
 
 //    if (predictpcrs()==false) adderror("PCR prediction doesn't work."); // can't call  twice
 
@@ -1341,13 +1350,45 @@ bool install_hooks()
     return true;
 }
 
+bool install_auto_update_arch()
+{
+    if (fs::exists("/etc/pacman.d"))
+    {
+
+        std::string  postupdate = 
+        "[Trigger]\n"
+        "Operation = Install\n"
+        "Operation = Upgrade\n"
+        "Type = Package\n"
+        "Target = linux\n"
+        "Target = fwupd\n"
+        "Target = systemd\n"
+        "Target = edk2-shell\n"
+        "\n"
+        "[Action]\n"
+        "Description =Updating Luksury EFI and PCRs\n"
+        "When = PostTransaction\n"
+        "Exec = /usr/bin/luksury update\n";
+
+        mkdir("/etc/pacman.d/hooks",0x755);
+
+        if (!saveFile("/etc/pacman.d/hooks/99-luksury.hook",postupdate,0755,false))
+        {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 bool install_auto_update()
 {
     std::string updatecommand = "#!/bin/sh\nluksury update\n";
-    if (!saveFile("/etc/initramfs/post-update.d/zzz-luksury",updatecommand,0755))
+    if (!saveFile("/etc/initramfs/post-update.d/zzz-luksury",updatecommand,0755,false))
     {
         // ubuntu failed, try arch
-        return false;
+           
+        return  install_auto_update_arch();
     }
     return true;
 }
@@ -1374,7 +1415,7 @@ bool initial_setup()
         std::cout << "Warning: Failed to install auto update for initrd or kernel updates\n";
     }
 
-    if (getFileSize("/usr/sbin/update-initramfs")!=0)
+    if (getFileSize("/usr/sbin/update-initramfs")>0)
     {
         int res = system("/usr/sbin/update-initramfs -u");
         return true;
