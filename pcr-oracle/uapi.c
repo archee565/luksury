@@ -179,7 +179,8 @@ uapi_find_matching_boot_entry(const char *dir_path,
 			continue;
 		}
 
-		if (uapi_boot_entry_applies(entry, machine_id, architecture)) {
+
+		if (uapi_boot_entry_applies(entry, machine_id, architecture) && strstr(d->d_name,"-fallback")==0) {
 			if (best == NULL || uapi_boot_entry_more_recent(entry, best)) {
 				/* swap best and entry */
 				uapi_boot_entry_t *tmp = best;

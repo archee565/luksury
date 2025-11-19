@@ -14,7 +14,7 @@
 #include <cstdlib>
 #include <functional>
 #include <unistd.h>
-#include <jsoncpp/json/json.h>  // Requires jsoncpp library
+#include <json/json.h>  // Requires jsoncpp library
 namespace fs = std::filesystem;
 
 #include <openssl/sha.h>  

@@ -15,7 +15,7 @@
 #include <cstdlib>
 #include <functional>
 #include <unistd.h>
-#include <jsoncpp/json/json.h>  // Requires jsoncpp library
+#include <json/json.h>  
 namespace fs = std::filesystem;
 
 #include <openssl/sha.h>  
@@ -1094,17 +1094,32 @@ bool has_dracut_config() {
     return false;
 }
 
-bool check_efivars()
-{
-   std::string path = "/sys/firmware/efi/efivars";
+enum class BootLoader {
+    SYSTEMD_BOOT,
+    GRUB,
+    UNKNOWN
+};
+
+BootLoader check_bootloader() {
+    std::string output = exec("bootctl status 2>&1");
     
-    for (const auto& entry : fs::directory_iterator(path)) {
-        if (entry.path().filename().string().find("LoaderInfo") == 0) {
-//            std::cout << "Found: " << entry.path() << std::endl;
-            return true;
-        }
-    }    
-    return false;
+    // Check for systemd-boot indicators
+    if (output.find("Product: systemd-boot") != std::string::npos) {
+        return BootLoader::SYSTEMD_BOOT;
+    }
+    
+    // Check for GRUB indicators
+    if (output.find("Product: GRUB") != std::string::npos) {
+        return BootLoader::GRUB;
+    }
+    
+    // If bootctl runs but doesn't show systemd-boot, likely GRUB
+    if (output.find("Firmware:") != std::string::npos &&
+        output.find("systemd-boot") == std::string::npos) {
+        return BootLoader::GRUB;
+    }
+        
+    return BootLoader::UNKNOWN;
 }
 
 bool predictpcrs();
@@ -1122,7 +1137,7 @@ void system_checks()
         adderror("Only systems with dracut initRAMFS generator are supported. (Dracut is default on Ubuntu from release 25.10)");
     }
 
-    if (!check_efivars()) adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
+    if (check_bootloader()!=BootLoader::SYSTEMD_BOOT) adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
 
     if (retrieve_current_pcr_values_concat(pcrSelection).empty()) adderror("Can't access TPM2");
 
@@ -1397,13 +1412,16 @@ int update_pcrs()
         std::cout << "using current PCRs\n";
         predicted_pcr_conc = current_pcr_values;
     }
-    if (current_pcr_values != predicted_pcr_conc)
-    {
-        std::cout << "predicted PCR values do not match current (system may have been updated)\n";
-    }
     else
     {
-        std::cout << "predicted PCR values = current\n";
+        if (current_pcr_values != predicted_pcr_conc)
+        {
+            std::cout << "predicted PCR values do not match current (system may have been updated)\n";
+        }
+        else
+        {
+            std::cout << "predicted PCR values = current\n";
+        }
     }
 
     if (!getTPMHandleAddress(true)) return 1;
@@ -1429,13 +1447,48 @@ int update_pcrs()
     return 0;
 }
 
+int pcr_test()
+{
+    if (check_bootloader()!=BootLoader::SYSTEMD_BOOT) 
+    {
+        adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
+        return 1;
+    }
 
+
+    std::cout << "Comparing predicted PCRs with current ones\n";
+    auto current_pcr_values = retrieve_current_pcr_values_concat(pcrSelection);
+    if (!predictpcrs())
+    {
+        std::cout << "using current PCRs\n";
+        predicted_pcr_conc = current_pcr_values;
+    }
+    else
+    {
+        if (current_pcr_values != predicted_pcr_conc)
+        {
+            std::cout << "predicted PCR values do not match current (system may have been updated)\n";
+
+            auto pcr_string = pcr_list_to_string(pcr_list);
+            char *args[]={"pcr-oracle","--from","eventlog","-F","tpm2-tools","all","--next-kernel","auto"};
+            predicted_pcr_conc.clear();
+            main_pcr_oracle(8, (args));
+
+
+        }
+        else
+        {
+            std::cout << "predicted PCR values = current\n";
+        }
+    }
+    return 0;
+}
 
 int main(int argc, char* argv[])
 {
     // commands: --help, setup, remove, update
     if (argc !=2) {
-        std::cout << "Usage: " << argv[0] << " [setup|remove|update]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " [setup|remove|update|pcrtest]" << std::endl;
         std::cout << "\nLUKSury is a utility, which adds a generated key to the root file system LUKS partition, and automatically unlocks the voluime without the need to enter password.\n";
         std::cout << "The generated key is stored in TPM2 device, and can be unsealed only when measured boot PCR values match the expected values.\n";
         std::cout << "LUKSury automatically precomputes the PCR values after system updates, or by invoking \"sudo luksury update\"\n";
@@ -1464,6 +1517,8 @@ int main(int argc, char* argv[])
         return remove_luksury();
     } else if (command == "update") {
         return update_pcrs();
+    } else if (command == "pcrtest") {
+        return pcr_test();
     } else {
         std::cout << "Unknown command: " << command << std::endl;
         return 1;
