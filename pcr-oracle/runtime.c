@@ -243,6 +243,12 @@ runtime_read_efi_variable(const char *var_name)
 	return __system_read_efi_variable(var_name);
 }
 
+bool file_exists(const char *filename)
+{
+	struct stat buf;
+	return stat(filename, &buf) == 0;
+}
+
 const tpm_evdigest_t *
 runtime_digest_efi_file(const tpm_algo_info_t *algo, const char *path)
 {
@@ -256,6 +262,10 @@ runtime_digest_efi_file(const tpm_algo_info_t *algo, const char *path)
 	 * The caller should know from the previous EFI BSA event for eg grub.efi
 	 * which partition is the ESP that was used. */
 	snprintf(esp_path, sizeof(esp_path), "/boot/efi%s", path);
+	if (!file_exists(esp_path))
+	{
+		snprintf(esp_path, sizeof(esp_path), "/efi%s", path);
+	}
 	md = digest_from_file(algo, esp_path, 0);
 	if (md && testcase_recording)
 		testcase_record_efi_digest(testcase_recording, path, md);

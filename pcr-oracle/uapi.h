@@ -42,7 +42,13 @@ typedef struct uapi_kernel_entry_tokens {
 } uapi_kernel_entry_tokens_t;
 
 #define UAPI_BOOT_DIRECTORY_EFI	"/loader/entries"
+/* Default boot directory (EFI path). We also probe other common locations at runtime. */
 #define UAPI_BOOT_DIRECTORY	"/boot/efi" UAPI_BOOT_DIRECTORY_EFI
+
+/* Return the first existing boot directory from a list of common locations.
+ * The returned pointer is to a static string and must not be freed.
+ */
+const char *uapi_find_existing_boot_dir(void);
 
 extern uapi_boot_entry_t *	uapi_get_boot_entry(const char *id);
 extern uapi_boot_entry_t *	uapi_find_boot_entry(const uapi_kernel_entry_tokens_t *match, const char *machine_id);

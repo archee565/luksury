@@ -191,6 +191,7 @@ sdb_identify_boot_entry(const char *id)
 	const char *machine_id;
 	uapi_boot_entry_t *result = NULL;
 
+
 	if (id == NULL || !strcasecmp(id, "auto")) {
 		match = get_valid_kernel_entry_tokens();
 	} else {
@@ -208,7 +209,9 @@ sdb_identify_boot_entry(const char *id)
 	machine_id = read_machine_id();
 
 	if (machine_id != NULL)
+	{
 		result = uapi_find_boot_entry(match, machine_id);
+	}
 
 done:
 	uapi_kernel_entry_tokens_destroy(&id_match);

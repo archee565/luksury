@@ -28,11 +28,44 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include "uapi.h"
 #include "util.h"
 
 #define UAPI_LINE_MAX		1024
+
+/* Candidate boot directories to probe in order. The first one that exists
+ * and is a directory will be used. The first entry is the default macro
+ * defined in `uapi.h` (typically "/boot/efi/loader/entries").
+ */
+static const char *uapi_boot_dir_candidates[] = {
+	UAPI_BOOT_DIRECTORY,
+	"/boot/loader/entries",
+	"/loader/entries",
+	"/efi/loader/entries",
+	NULL
+};
+
+const char *
+uapi_find_existing_boot_dir(void)
+{
+	static const char *cached = NULL;
+	struct stat st;
+
+	if (cached)
+		return cached;
+
+	for (const char **p = uapi_boot_dir_candidates; *p; ++p) {
+		if (stat(*p, &st) == 0 && S_ISDIR(st.st_mode)) {
+			cached = *p;
+			return cached;
+		}
+	}
+
+	/* Fallback to the compile-time default */
+	return UAPI_BOOT_DIRECTORY;
+}
 
 
 static int	vercmp(const void *va, const void *vb);
@@ -210,10 +243,12 @@ uapi_get_boot_entry(const char *id)
 {
 	char path[PATH_MAX];
 
+	const char *dir = uapi_find_existing_boot_dir();
+
 	if (path_has_file_extension(id, ".conf"))
-		snprintf(path, sizeof(path), "%s/%s", UAPI_BOOT_DIRECTORY, id);
+		snprintf(path, sizeof(path), "%s/%s", dir, id);
 	else
-		snprintf(path, sizeof(path), "%s/%s.conf", UAPI_BOOT_DIRECTORY, id);
+		snprintf(path, sizeof(path), "%s/%s.conf", dir, id);
 
 	if (access(path, R_OK) < 0)
 		return NULL;
@@ -231,9 +266,12 @@ uapi_find_boot_entry(const uapi_kernel_entry_tokens_t *match, const char *machin
 	if (uname(&uts) >= 0)
 		architecture = uts.machine;
 
-	return uapi_find_matching_boot_entry(UAPI_BOOT_DIRECTORY,
-			match, machine_id, architecture,
-			&best);
+	/* Search all candidate directories and keep the best match */
+	for (const char **p = uapi_boot_dir_candidates; *p; ++p) {
+		uapi_find_matching_boot_entry(*p, match, machine_id, architecture, &best);
+	}
+
+	return best;
 }
 
 void

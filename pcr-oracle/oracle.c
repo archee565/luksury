@@ -144,7 +144,7 @@ static struct option options[] = {
 	{ NULL }
 };
 
-unsigned int opt_debug	= 0;
+unsigned int opt_debug = 0;
 unsigned int opt_use_pesign = 0;
 
 static void	predictor_report_plain(struct predictor *pred, unsigned int pcr_index);
@@ -710,8 +710,8 @@ predictor_update_eventlog(struct predictor *pred)
 	 * FIXME: we should probably hide this behind a target_platform function.
 	 */
 	if (pred->boot_entry_id != NULL) {
-		snprintf(boot_entry_path, sizeof(boot_entry_path),
-			 "%s/%s", UAPI_BOOT_DIRECTORY, pred->boot_entry_id);
+		   snprintf(boot_entry_path, sizeof(boot_entry_path),
+			   "%s/%s", uapi_find_existing_boot_dir(), pred->boot_entry_id);
 		assign_string(&rehash_ctx.boot_entry_path, boot_entry_path);
 		if (!(rehash_ctx.boot_entry = sdb_identify_boot_entry(pred->boot_entry_id)))
 			fatal("unable to identify next kernel \"%s\"\n", pred->boot_entry_id);
