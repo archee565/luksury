@@ -1220,6 +1220,7 @@ bool extra_luks_key_setup()
 
         // add a second keys of the user's password
         command = "cryptsetup luksAddKey --iter-time=500 --key-file "+passwdfile.get_path()+" --verbose /dev/"+root_device_name+" "+passwdfile.get_path();
+        result = exec(command.c_str());
         std::cout << result << std::endl;
         if (result.find("Command successful.")==std::string::npos)
         {
