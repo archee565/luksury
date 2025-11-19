@@ -31,7 +31,7 @@ Checklist:
  - PCR prediction testing
 */
 
-std::vector<int> pcr_list = {0,1,2,4,5,7,9,15};
+std::vector<int> pcr_list = {0,2,4,5,7,9,15};
 #define DATA_DIR "/var/lib/luksury"
 #define ROOT_KEY_FILE DATA_DIR "/root_keyfile.bin"
 #define DRACUT_PATH "/usr/lib/dracut/modules.d/89luksury"
