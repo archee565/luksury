@@ -1131,6 +1131,11 @@ bool checkTpm2Tools() {
     return (result == 0);
 }
 
+bool is_initramfs_tools_installed()
+{
+    return fs::exists("/usr/share/initramfs-tools/init");
+}
+
 void system_checks()
 {
     if (getuid() != 0) 
@@ -1147,6 +1152,11 @@ void system_checks()
     if (!is_dracut_available() || !has_dracut_config())
     {
         adderror("Only systems with dracut initRAMFS generator are supported. (Dracut is default on Ubuntu from release 25.10)");
+    }
+
+    if (is_initramfs_tools_installed())
+    {
+        adderror("Fully remove initramfs-tools Ubuntu package and do \"apt autoremove\"");
     }
 
     if (check_bootloader()!=BootLoader::SYSTEMD_BOOT) adderror("System wasn't booted with systemd-boot. Install systemd-boot then reboot before retrying.");
