@@ -11,8 +11,13 @@ the systemd components that do:
 
 It is intentionally aimed at the classic "vmlinuz + initrd" systemd-boot
 layout, not at unified kernel images (UKIs).  The update hook refreshes the
-pcrlock policy after a kernel/initrd update; the LUKS token itself does not
-need to be re-enrolled.
+pcrlock policy after a kernel/initrd or boot-loader update; the LUKS token
+itself does not need to be re-enrolled.
+
+The policy covers PCR 4 (boot loader), PCR 7 (Secure Boot policy when
+available) and PCR 9 (initrd and kernel command line).  It is made available to
+the initramfs through the credential systemd-pcrlock writes to
+$BOOT/loader/credentials; luksury no longer keeps its own copy on the ESP.
 
 Commands:
   luksury setup [--mode=auto|pcrlock|literal]
@@ -44,7 +49,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "2.0.2"
+VERSION = "2.2.0"
 PROG = "luksury"
 
 CONFIG_DIR = Path("/etc/luksury")
@@ -52,7 +57,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_DIR = Path("/var/lib/luksury")
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = Path("/var/log/luksury.log")
-LOCK_FILE = Path("/run/lock/luksury.lock")
+# /run/lock is world-writable with the sticky bit on some distributions.  With
+# fs.protected_regular=2, a lock file left there by an unprivileged user cannot
+# be reopened by root with O_CREAT.  Keep our lock in a root-owned subdirectory.
+LOCK_FILE = Path("/run/luksury/luksury.lock")
+LEGACY_LOCK_FILE = Path("/run/lock/luksury.lock")
 INSTALLED_BIN = Path("/usr/local/sbin/luksury")
 
 DRACUT_MODULE_DIR = Path("/usr/lib/dracut/modules.d/89luksury")
@@ -60,14 +69,31 @@ DRACUT_CONF = Path("/etc/dracut.conf.d/99-luksury.conf")
 KERNEL_INSTALL_HOOK = Path("/etc/kernel/install.d/99-luksury.install")
 INITRAMFS_HOOK = Path("/etc/initramfs/post-update.d/zzz-luksury")
 PACMAN_HOOK = Path("/etc/pacman.d/hooks/99-luksury.hook")
+BOOT_UPDATE_DROPIN = Path("/etc/systemd/system/systemd-boot-update.service.d/99-luksury.conf")
 
 PCRLOCK_JSON = Path("/var/lib/systemd/pcrlock.json")
 PCRLOCK_RUNTIME = Path("/run/systemd/pcrlock.json")
 PCRLOCK_COMPONENT_DIR = Path("/var/lib/pcrlock.d")
 PCRLOCK_CMDLINE_COMPONENT = "710-kernel-cmdline"
 PCRLOCK_INITRD_COMPONENT = "720-kernel-initrd"
-BOOT_POLICY_SUBDIR = "luksury"
-BOOT_POLICY_NAME = "pcrlock.json"
+PCRLOCK_BOOTLOADER_COMPONENT = "630-bootloader"
+# PCR 4 is special: some firmware measures extra records into it (drivers,
+# boot-option actions, proprietary PE hashes) that systemd-pcrlock's lock-pe
+# component cannot describe.  luksury therefore builds a private component set
+# from the validated TPM event log, with one variant for the running boot and
+# one per known boot loader PE.
+PCRLOCK_PCR4_COMPONENT = "400-pcr4"
+PCRLOCK_PRIVATE_COMPONENTS = STATE_DIR / "pcrlock.d"
+PCRLOCK_COMPONENT_SEARCH_DIRS = (
+    "/etc/pcrlock.d",
+    "/run/pcrlock.d",
+    "/var/lib/pcrlock.d",
+    "/usr/local/lib/pcrlock.d",
+    "/usr/lib/pcrlock.d",
+)
+# Files written by luksury <= 2.0.  Kept for cleanup on remove.
+LEGACY_BOOT_POLICY_SUBDIR = "luksury"
+LEGACY_BOOT_POLICY_NAME = "pcrlock.json"
 
 # Stop pcrlock's component list after 720-kernel-initrd.  Components from
 # 750- onwards (750-enter-initrd, 750-os-separator, 770-nvpcr-separator, ...)
@@ -78,8 +104,8 @@ BOOT_POLICY_NAME = "pcrlock.json"
 # The value must sort after 720 and before 750.
 DEFAULT_PCRLOCK_LOCATION = "740"
 
-DEFAULT_PCRLOCK_PCRS = [7, 9]
-DEFAULT_LITERAL_PCRS = [7, 9, 12]
+DEFAULT_PCRLOCK_PCRS = [4, 7, 9]
+DEFAULT_LITERAL_PCRS = [4, 7, 9, 12]
 
 log = logging.getLogger(PROG)
 
@@ -158,6 +184,14 @@ def cryptsetup_setup_bin() -> str:
 
 def bootctl_bin() -> Optional[str]:
     return which("bootctl", fallbacks=("/usr/bin/bootctl",))
+
+
+def systemd_creds_bin() -> Optional[str]:
+    return which("systemd-creds", fallbacks=("/usr/bin/systemd-creds",))
+
+
+def efibootmgr_bin() -> Optional[str]:
+    return which("efibootmgr", fallbacks=("/usr/sbin/efibootmgr", "/usr/bin/efibootmgr"))
 
 
 def systemd_boot_active() -> bool:
@@ -348,14 +382,43 @@ def setup_logging(verbose: bool = False, log_to_file: bool = True) -> None:
     log.propagate = False
 
 
+def _cleanup_legacy_lock() -> None:
+    """Remove a stale /run/lock lock left by an older or unprivileged run."""
+    if os.geteuid() != 0:
+        return
+    try:
+        fd = os.open(LEGACY_LOCK_FILE, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        try:
+            LEGACY_LOCK_FILE.unlink()
+            log.info("Removed stale legacy lock file %s", LEGACY_LOCK_FILE)
+        except OSError as exc:
+            log.debug("Cannot remove legacy lock file %s: %s", LEGACY_LOCK_FILE, exc)
+    finally:
+        os.close(fd)
+
+
 class FileLock:
     def __init__(self, path: Path = LOCK_FILE):
         self.path = path
         self.fd: Optional[int] = None
 
     def __enter__(self) -> "FileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        _cleanup_legacy_lock()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError as exc:
+            die(
+                f"cannot open lock file {self.path}: {exc.strerror or exc}. "
+                "Run this command as root; if the file is stale, remove it."
+            )
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -386,6 +449,13 @@ class Config:
     boot_fstype: str = ""
     boot_mount: str = ""
     boot_device: str = ""
+    # systemd-pcrlock writes its policy as a credential to $BOOT/loader/credentials.
+    # $BOOT can be on XBOOTLDR while loader.conf lives on the ESP, so keep the
+    # credential partition separate from the boot-entry partition.
+    credential_uuid: str = ""
+    credential_fstype: str = ""
+    credential_mount: str = ""
+    bootloader_pes: list[str] = dataclasses.field(default_factory=list)
     luks_device: str = ""
     luks_name: str = ""
     luks_uuid: str = ""
@@ -420,6 +490,18 @@ def load_config(required: bool = False) -> Optional[Config]:
                 DEFAULT_PCRLOCK_LOCATION,
             )
             cfg.pcrlock_location = DEFAULT_PCRLOCK_LOCATION
+        # 2.0.x defaulted to PCR 7 and 9 only.  Add the boot loader (PCR 4) for
+        # existing installs unless the user explicitly configured something else.
+        if (
+            cfg.mode == "pcrlock"
+            and sorted(cfg.pcrs) == [7, 9]
+            and cfg.created_by.startswith("2.0")
+        ):
+            log.warning(
+                "migrating the default PCR set from 7,9 to 4,7,9 to include the boot loader"
+            )
+            cfg.pcrs = list(DEFAULT_PCRLOCK_PCRS)
+            cfg.created_by = VERSION
         return cfg
     except (OSError, ValueError, TypeError) as exc:
         die(f"cannot read {CONFIG_FILE}: {exc}")
@@ -645,8 +727,59 @@ def find_boot_partition() -> BootPartition:
     die(
         "cannot find the systemd-boot partition (no loader/loader.conf on a "
         "separate unencrypted partition). The classic-boot design needs the "
-        "pcrlock policy to be readable from the boot partition before unlocking."
+        "pcrlock credential to be readable from the boot partition before unlocking."
     )
+
+
+def find_credential_partition() -> Optional[BootPartition]:
+    """Return the partition systemd-pcrlock writes loader/credentials to.
+
+    systemd-pcrlock prefers XBOOTLDR over the ESP, exactly like bootctl's
+    --print-boot-path.  This can be a different partition than the one holding
+    loader.conf, so the initramfs must mount the credential partition itself.
+    """
+    bc = bootctl_bin()
+    if not bc:
+        return None
+    for arg in ("--print-boot-path", "--print-esp-path"):
+        cp = run([bc, arg], capture=True, check=False)
+        if cp.returncode != 0 or not cp.stdout.strip():
+            continue
+        path = Path(cp.stdout.strip())
+        if not path.exists():
+            continue
+        cp = run(
+            ["findmnt", "-n", "-o", "UUID,FSTYPE,SOURCE,TARGET", "--target", str(path)],
+            capture=True,
+            check=False,
+        )
+        if cp.returncode != 0 or not cp.stdout.strip():
+            continue
+        fields = cp.stdout.split()
+        if len(fields) < 4 or fields[3] == "/":
+            continue
+        return BootPartition(
+            mount=Path(fields[3]),
+            uuid=fields[0],
+            fstype=fields[1],
+            device=fields[2],
+        )
+    return None
+
+
+def credential_partition(cfg: Config) -> BootPartition:
+    return BootPartition(
+        mount=Path(cfg.credential_mount or cfg.boot_mount),
+        uuid=cfg.credential_uuid or cfg.boot_uuid,
+        fstype=cfg.credential_fstype or cfg.boot_fstype,
+    )
+
+
+def boot_credential_paths(cfg: Config) -> list[Path]:
+    if not (cfg.credential_mount or cfg.boot_mount):
+        return []
+    part = credential_partition(cfg)
+    return sorted((part.mount / "loader" / "credentials").glob("pcrlock.*.cred"))
 
 
 def _read_kv_file(path: Path) -> list[tuple[str, str]]:
@@ -1087,7 +1220,7 @@ def _write_pcrlock_variant(component: str, source: Path, dry_run: bool) -> Path:
     """Generate one pcrlock component variant and install it atomically."""
     binary = pcrlock_bin()
     if not binary:
-        die("systemd-pcrlock was not found (install systemd >= 255)")
+        die("systemd-pcrlock was not found (install systemd >= 256)")
 
     prefix = "initrd" if component == PCRLOCK_INITRD_COMPONENT else "cmdline"
     verb = "lock-kernel-initrd" if prefix == "initrd" else "lock-kernel-cmdline"
@@ -1124,6 +1257,535 @@ def _write_pcrlock_variant(component: str, source: Path, dry_run: bool) -> Path:
     return dest
 
 
+_BOOTLOADER_VARIANT_RE = re.compile(r"^pe-[0-9a-f]{16}\.pcrlock$")
+
+
+def _efi_architecture() -> str:
+    bc = bootctl_bin()
+    if bc:
+        cp = run([bc, "--print-efi-architecture"], capture=True, check=False)
+        if cp.returncode == 0 and cp.stdout.strip():
+            return cp.stdout.strip()
+    return "x64"
+
+
+def _current_efi_boot_pe(boot: BootPartition) -> Optional[Path]:
+    """Best-effort path of the PE binary firmware loaded for this boot."""
+    eb = efibootmgr_bin()
+    if not eb:
+        return None
+    cp = run([eb, "-v"], capture=True, check=False)
+    if cp.returncode != 0:
+        return None
+
+    current: Optional[str] = None
+    entries: dict[str, str] = {}
+    for line in cp.stdout.splitlines():
+        match = re.match(r"^BootCurrent:\s*([0-9A-Fa-f]{4})", line)
+        if match:
+            current = match.group(1).upper()
+            continue
+        match = re.match(r"^Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", line)
+        if match:
+            entries[match.group(1).upper()] = match.group(2)
+    if not current or current not in entries:
+        return None
+
+    match = re.search(r"(/\\[^\s]+?\.efi)", entries[current], re.IGNORECASE)
+    if not match:
+        return None
+    rel = match.group(1).replace("\\", "/").lstrip("/")
+    candidate = boot.mount / rel
+    return candidate if candidate.is_file() else None
+
+
+def find_bootloader_pe_paths(cfg: Config) -> list[Path]:
+    """Return the PE binaries whose measurements PCR 4 should cover."""
+    boot = BootPartition(
+        mount=Path(cfg.boot_mount),
+        uuid=cfg.boot_uuid,
+        fstype=cfg.boot_fstype,
+        device=cfg.boot_device,
+    )
+    candidates: list[Path] = []
+
+    bc = bootctl_bin()
+    if bc:
+        cp = run([bc, "--print-loader-path"], capture=True, check=False)
+        if cp.returncode == 0 and cp.stdout.strip():
+            candidates.append(Path(cp.stdout.strip()))
+
+    current = _current_efi_boot_pe(boot)
+    if current is not None:
+        candidates.append(current)
+
+    arch = _efi_architecture()
+    for rel in (
+        f"EFI/systemd/systemd-boot{arch}.efi",
+        f"EFI/systemd/systemd-boot-fallback{arch}.efi",
+        f"EFI/BOOT/BOOT{arch.upper()}.EFI",
+    ):
+        candidate = boot.mount / rel
+        if candidate.is_file():
+            candidates.append(candidate)
+
+    for raw in cfg.bootloader_pes:
+        candidate = Path(raw)
+        if candidate.is_file():
+            candidates.append(candidate)
+        else:
+            log.warning("configured boot loader PE not found: %s", candidate)
+
+    result: list[Path] = []
+    seen_hashes: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if not resolved.is_file():
+            continue
+        try:
+            digest = sha256_file(resolved)
+        except OSError as exc:
+            log.warning("cannot read boot loader PE %s: %s", resolved, exc)
+            continue
+        if digest in seen_hashes:
+            continue
+        seen_hashes.add(digest)
+        result.append(resolved)
+
+    if not result:
+        log.warning(
+            "no boot loader PE files found; PCR 4 will not be included in the policy"
+        )
+    return result
+
+
+def pe_variant_path(pe: Path) -> Path:
+    digest = sha256_file(pe)
+    return pcrlock_component_dir(PCRLOCK_BOOTLOADER_COMPONENT) / f"pe-{digest[:16]}.pcrlock"
+
+
+def _write_pe_variant(pe: Path, dry_run: bool) -> Path:
+    """Generate one PCR 4 boot loader variant and install it atomically."""
+    binary = pcrlock_bin()
+    if not binary:
+        die("systemd-pcrlock was not found (install systemd >= 256)")
+    if not pe.is_file():
+        die(f"boot loader PE not found: {pe}")
+
+    dest = pe_variant_path(pe)
+    if dry_run:
+        log.info("[dry-run] would write pcrlock boot loader variant %s from %s", dest, pe)
+        return dest
+    if dest.exists():
+        return dest
+
+    d = dest.parent
+    d.mkdir(parents=True, exist_ok=True)
+    fd, tmpname = tempfile.mkstemp(prefix=f".{dest.name}.", dir=str(d))
+    os.close(fd)
+    tmp = Path(tmpname)
+    try:
+        run([binary, "lock-pe", "--pcr=4", f"--pcrlock={tmp}", str(pe)])
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+        os.sync()
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    log.info("Wrote pcrlock boot loader variant %s", dest)
+    return dest
+
+
+def _pcrlock_digest_map(record: dict[str, Any]) -> dict[str, str]:
+    """Return {hash algorithm: lower-case hex digest} for a CEL/.pcrlock record."""
+    digests: dict[str, str] = {}
+    for item in record.get("digests", []):
+        if not isinstance(item, dict):
+            continue
+        alg = item.get("hashAlg")
+        digest = item.get("digest")
+        if isinstance(alg, str) and isinstance(digest, str):
+            digests[alg.lower()] = digest.lower()
+    return digests
+
+
+def _pcrlock_record_list(path: Path) -> Optional[list[dict[str, Any]]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    records = data.get("records")
+    if not isinstance(records, list):
+        return None
+    return [r for r in records if isinstance(r, dict)]
+
+
+def _pcrlock_cel_records(binary: str) -> Optional[list[dict[str, Any]]]:
+    """Read the combined TPM event log as TCG CEL-JSON.
+
+    `systemd-pcrlock cel` reads the firmware event log and the userspace log
+    without requiring a valid component set, which is exactly what we need to
+    build components for PCR 4.
+    """
+    cp = run([binary, "cel", "--json=short"], capture=True, check=False)
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or "").strip()
+        log.warning("systemd-pcrlock cel failed: %s", detail or f"exit status {cp.returncode}")
+        return None
+    try:
+        data = json.loads(cp.stdout)
+    except ValueError as exc:
+        log.warning("cannot parse systemd-pcrlock cel output: %s", exc)
+        return None
+    if not isinstance(data, list):
+        log.warning("systemd-pcrlock cel did not return a JSON array")
+        return None
+    return [r for r in data if isinstance(r, dict)]
+
+
+def _tpm_pcr_value(pcr: int, algorithm: str = "sha256") -> Optional[str]:
+    for path in (
+        Path(f"/sys/class/tpm/tpm0/pcr-{algorithm}/{pcr}"),
+        Path(f"/sys/class/tpm/tpm0/pcr-{algorithm.upper()}/{pcr}"),
+    ):
+        try:
+            value = path.read_text(encoding="ascii").strip().lower()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]+", value):
+            return value
+    return None
+
+
+def _pcr4_extend(records: list[dict[str, Any]], algorithm: str = "sha256") -> Optional[str]:
+    """Replay the PCR 4 records exactly as the TPM would, returning hex."""
+    try:
+        size = hashlib.new(algorithm).digest_size
+    except ValueError:
+        return None
+    value = b"\0" * size
+    for record in records:
+        digest = _pcrlock_digest_map(record).get(algorithm)
+        if digest is None:
+            return None
+        try:
+            raw = bytes.fromhex(digest)
+        except ValueError:
+            return None
+        if len(raw) != size:
+            return None
+        value = hashlib.new(algorithm, value + raw).digest()
+    return value.hex()
+
+
+def _pcr4_records(cel: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in cel if record.get("pcr") == 4]
+
+
+def _pcr4_loader_indices(records: list[dict[str, Any]]) -> list[int]:
+    """Indices of EV_EFI_BOOT_SERVICES_APPLICATION records in the PCR 4 list."""
+    indices: list[int] = []
+    for index, record in enumerate(records):
+        if record.get("content_type") != "pcclient_std":
+            continue
+        content = record.get("content")
+        if not isinstance(content, dict):
+            continue
+        event_type = content.get("event_type")
+        if isinstance(event_type, str) and event_type.upper() == "EV_EFI_BOOT_SERVICES_APPLICATION":
+            indices.append(index)
+    return indices
+
+
+def _bootloader_digest_variants() -> list[dict[str, str]]:
+    """Distinct lock-pe digest maps from the installed 630-bootloader variants."""
+    result: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    directory = pcrlock_component_dir(PCRLOCK_BOOTLOADER_COMPONENT)
+    if not directory.is_dir():
+        return result
+    for path in sorted(directory.glob("*.pcrlock")):
+        if not _BOOTLOADER_VARIANT_RE.fullmatch(path.name):
+            continue
+        records = _pcrlock_record_list(path)
+        if not records:
+            continue
+        pcr4 = [record for record in records if record.get("pcr") == 4]
+        if len(pcr4) != 1:
+            continue
+        digests = _pcrlock_digest_map(pcr4[0])
+        if "sha256" not in digests:
+            continue
+        key = tuple(sorted(digests.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(digests)
+    return result
+
+
+def _slim_pcr4_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the fields that pcrlock component files actually use."""
+    return [
+        {
+            "pcr": 4,
+            "digests": [
+                {"hashAlg": item["hashAlg"], "digest": item["digest"]}
+                for item in record.get("digests", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("hashAlg"), str)
+                and isinstance(item.get("digest"), str)
+            ],
+        }
+        for record in records
+    ]
+
+
+def _replace_pcr4_record(
+    records: list[dict[str, Any]], index: Optional[int], digests: dict[str, str]
+) -> list[dict[str, Any]]:
+    copied = [
+        {**record, "digests": [dict(item) for item in record.get("digests", []) if isinstance(item, dict)]}
+        for record in records
+    ]
+    if index is not None:
+        copied[index]["digests"] = [
+            {"hashAlg": algorithm, "digest": digest}
+            for algorithm, digest in sorted(digests.items())
+        ]
+    return copied
+
+
+def _pcr4_variants(
+    records: list[dict[str, Any]],
+    bootloader_digests: Sequence[dict[str, str]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Build the running-boot variant plus one variant per known boot loader.
+
+    The firmware is responsible for measuring PCR 4.  We take the actual record
+    sequence from the event log (validated against the TPM below) and only
+    substitute the EV_EFI_BOOT_SERVICES_APPLICATION record when predicting a
+    different boot loader PE.  This keeps firmware-specific extra records, which
+    lock-pe cannot describe, intact.
+    """
+    slim = _slim_pcr4_records(records)
+    variants: list[tuple[str, list[dict[str, Any]]]] = [("running", slim)]
+    loader_indices = _pcr4_loader_indices(records)
+    if len(loader_indices) != 1:
+        if len(loader_indices) > 1:
+            log.warning(
+                "PCR 4 contains %d EV_EFI_BOOT_SERVICES_APPLICATION records; "
+                "only the running boot can be predicted",
+                len(loader_indices),
+            )
+        return variants
+
+    index = loader_indices[0]
+    for digests in bootloader_digests:
+        name = f"pe-{digests['sha256'][:16]}"
+        variants.append((name, _replace_pcr4_record(slim, index, digests)))
+    return variants
+
+
+def _filter_pcr4_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if record.get("pcr") != 4]
+
+
+def _copy_prediction_components(dest_root: Path) -> None:
+    """Copy all non-PCR4 components into the private component tree.
+
+    Components that touch PCR 4 are replaced by the event-log-derived
+    component.  Components that touch PCR 4 *and* other PCRs (for example the
+    separator) are kept with their PCR 4 records removed.
+    """
+    for base in reversed(PCRLOCK_COMPONENT_SEARCH_DIRS):
+        root = Path(base)
+        if not root.is_dir():
+            continue
+        for source in sorted(root.rglob("*.pcrlock")):
+            if not source.is_file():
+                continue
+            records = _pcrlock_record_list(source)
+            if records is None:
+                continue
+            filtered = _filter_pcr4_records(records)
+            if not filtered:
+                continue
+            destination = dest_root / source.relative_to(root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps({"records": filtered}, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(destination, 0o644)
+
+
+def _install_prediction_components(staging: Path) -> Path:
+    final = PCRLOCK_PRIVATE_COMPONENTS
+    previous = STATE_DIR / "pcrlock.d.old"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if previous.exists():
+        shutil.rmtree(previous)
+    if final.exists():
+        os.replace(final, previous)
+    try:
+        os.replace(staging, final)
+    except OSError:
+        if previous.exists() and not final.exists():
+            os.replace(previous, final)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
+    os.chmod(final, 0o755)
+    return final
+
+
+def prepare_pcrlock_components(cfg: Config, dry_run: bool = False) -> Optional[Path]:
+    """Build the private component set used to predict PCR 4.
+
+    The PCR 4 prediction is derived from the current boot's validated event log
+    rather than from `lock-pe` alone.  This is necessary because firmware often
+    records extra measurements in PCR 4 (drivers, boot option actions, or a
+    non-standard PE hash) that `lock-pe` does not describe.  The event log is
+    checked against the live TPM value before it is trusted.
+    """
+    if 4 not in cfg.pcrs:
+        return None
+    if dry_run:
+        log.info("[dry-run] would build PCR 4 prediction components from the TPM event log")
+        return None
+
+    binary = pcrlock_bin()
+    if not binary:
+        die("systemd-pcrlock was not found (install systemd >= 256)")
+
+    cel = _pcrlock_cel_records(binary)
+    if cel is None:
+        die(
+            "cannot read the TPM event log, so PCR 4 (boot loader) cannot be predicted. "
+            "Refusing to update the policy. Check that /sys/kernel/security/tpm0/"
+            "binary_bios_measurements is readable and see `systemd-pcrlock log`."
+        )
+
+    records = _pcr4_records(cel)
+    if not records:
+        die(
+            "the TPM event log contains no PCR 4 measurements, so the boot loader "
+            "cannot be bound. Refusing to update the policy."
+        )
+
+    calculated = _pcr4_extend(records)
+    if calculated is None:
+        die(
+            "the PCR 4 event log contains a record without a usable SHA-256 digest; "
+            "refusing to build a policy from an incomplete prediction"
+        )
+    current = _tpm_pcr_value(4)
+    if current is None:
+        log.warning("cannot read the current PCR 4 value from the TPM; relying on systemd-pcrlock validation")
+    elif calculated != current:
+        die(
+            "the PCR 4 event log does not match the current TPM value "
+            f"(event log {calculated}, TPM {current}); refusing to build a policy. "
+            "See `systemd-pcrlock log`."
+        )
+
+    variants = _pcr4_variants(records, _bootloader_digest_variants())
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".pcrlock.d.", dir=str(STATE_DIR)))
+    except OSError as exc:
+        die(f"cannot create the PCR 4 prediction component directory: {exc}")
+
+    try:
+        _copy_prediction_components(staging)
+        component_dir = staging / f"{PCRLOCK_PCR4_COMPONENT}.pcrlock.d"
+        component_dir.mkdir(parents=True, exist_ok=True)
+        seen: set[str] = set()
+        written = 0
+        for name, variant_records in variants:
+            key = json.dumps(variant_records, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            destination = component_dir / f"{name}.pcrlock"
+            destination.write_text(
+                json.dumps({"records": variant_records}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(destination, 0o644)
+            written += 1
+        if written == 0:
+            die("could not build any PCR 4 prediction variant")
+        _install_prediction_components(staging)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        die(f"cannot build the PCR 4 prediction components: {exc}")
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    log.info(
+        "Prepared %d PCR 4 prediction variant(s) from the event log in %s",
+        written,
+        PCRLOCK_PRIVATE_COMPONENTS,
+    )
+    return PCRLOCK_PRIVATE_COMPONENTS
+
+
+def pcrlock_components_args(cfg: Config, *, dry_run: bool = False) -> list[str]:
+    if 4 not in cfg.pcrs:
+        return []
+    if not PCRLOCK_PRIVATE_COMPONENTS.is_dir():
+        if dry_run:
+            return [f"--components={PCRLOCK_PRIVATE_COMPONENTS}"]
+        die(
+            "internal error: PCR 4 prediction components are missing. "
+            f"Expected {PCRLOCK_PRIVATE_COMPONENTS}; run `{PROG} update` again."
+        )
+    return [f"--components={PCRLOCK_PRIVATE_COMPONENTS}"]
+
+
+def prune_bootloader_variants(
+    keep: set[Path], max_old: int = 3, dry_run: bool = False
+) -> None:
+    """Keep current PE variants plus a few old ones for the running boot.
+
+    A systemd-boot update replaces the PE on the ESP before the next boot.  The
+    running (old) boot's event log still refers to the previous measurement, so
+    dropping all old variants would make pcrlock drop PCR 4.  Keeping a few
+    recent variants covers the transition without retaining every boot loader
+    ever installed.
+    """
+    d = pcrlock_component_dir(PCRLOCK_BOOTLOADER_COMPONENT)
+    if not d.is_dir():
+        return
+    keep_resolved = {p.resolve() for p in keep}
+    old: list[Path] = []
+    for path in d.glob("*.pcrlock"):
+        if not _BOOTLOADER_VARIANT_RE.fullmatch(path.name):
+            continue
+        try:
+            if path.resolve() in keep_resolved:
+                continue
+        except OSError:
+            pass
+        old.append(path)
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    old.sort(key=mtime, reverse=True)
+    for path in old[max_old:]:
+        remove_file(path, dry_run)
+
+
 def prune_pcrlock_variants(component: str, keep: set[Path], dry_run: bool = False) -> None:
     """Remove variants luksury created previously, retaining the given ones."""
     d = pcrlock_component_dir(component)
@@ -1149,16 +1811,16 @@ def run_pcrlock_locks(
     running_initrd: Optional[Path] = None,
     running_cmdline: Optional[Path] = None,
     dry_run: bool = False,
-) -> tuple[set[Path], set[Path], bool]:
-    """Write pcrlock variants for the running and target initrd/cmdline.
+) -> tuple[set[Path], set[Path], set[Path], bool]:
+    """Write pcrlock variants for initrd/cmdline and the boot loader PE.
 
-    Returns (initrd variants, cmdline variants, can_prune).  The caller must
-    only prune after make-policy has succeeded, so a failed prediction leaves
-    the previous component set intact.
+    Returns (initrd variants, cmdline variants, boot loader variants,
+    can_prune).  The caller must only prune after make-policy has succeeded, so
+    a failed prediction leaves the previous component set intact.
     """
     binary = pcrlock_bin()
     if not binary:
-        die("systemd-pcrlock was not found (install systemd >= 255)")
+        die("systemd-pcrlock was not found (install systemd >= 256)")
     if not pcrlock_supported():
         die(
             "this TPM does not support systemd-pcrlock (PolicyAuthorizeNV, TPM 2.0 rev 1.38+). "
@@ -1170,6 +1832,7 @@ def run_pcrlock_locks(
 
     keep_initrd: set[Path] = set()
     keep_cmdline: set[Path] = set()
+    keep_bootloader: set[Path] = set()
 
     # The running image must remain covered while the event log still refers
     # to it.  The target image is what the next boot will use.
@@ -1180,6 +1843,10 @@ def run_pcrlock_locks(
     if running_cmdline is not None:
         keep_cmdline.add(_write_pcrlock_variant(PCRLOCK_CMDLINE_COMPONENT, running_cmdline, dry_run))
     keep_cmdline.add(_write_pcrlock_variant(PCRLOCK_CMDLINE_COMPONENT, target_cmdline, dry_run))
+
+    if 4 in cfg.pcrs:
+        for pe in find_bootloader_pe_paths(cfg):
+            keep_bootloader.add(_write_pe_variant(pe, dry_run))
 
     if cfg.lock_gpt:
         run([binary, "lock-gpt"], dry_run=dry_run)
@@ -1199,12 +1866,13 @@ def run_pcrlock_locks(
     # Only allow pruning when we actually know the running variants; otherwise
     # an old variant may be the only one that still matches the current event log.
     can_prune = running_initrd is not None and running_cmdline is not None
-    return keep_initrd, keep_cmdline, can_prune
+    return keep_initrd, keep_cmdline, keep_bootloader, can_prune
 
 
 def prune_variants_after_success(
     keep_initrd: set[Path],
     keep_cmdline: set[Path],
+    keep_bootloader: set[Path],
     can_prune: bool,
     dry_run: bool = False,
 ) -> None:
@@ -1212,10 +1880,13 @@ def prune_variants_after_success(
         return
     prune_pcrlock_variants(PCRLOCK_INITRD_COMPONENT, keep_initrd)
     prune_pcrlock_variants(PCRLOCK_CMDLINE_COMPONENT, keep_cmdline)
+    prune_bootloader_variants(keep_bootloader)
 
 
-def pcrlock_predict_pcrs(cfg: Config, dry_run: bool = False) -> Optional[set[int]]:
-    """Run `systemd-pcrlock predict` and return the PCR set it can cover."""
+def pcrlock_predict_values(
+    cfg: Config, dry_run: bool = False
+) -> Optional[dict[int, list[str]]]:
+    """Run `systemd-pcrlock predict` and return predicted values per PCR."""
     binary = pcrlock_bin()
     if not binary:
         die("systemd-pcrlock was not found")
@@ -1228,6 +1899,7 @@ def pcrlock_predict_pcrs(cfg: Config, dry_run: bool = False) -> Optional[set[int
         cmd.append(f"--pcr={pcr}")
     if cfg.pcrlock_location:
         cmd.append(f"--location={cfg.pcrlock_location}")
+    cmd.extend(pcrlock_components_args(cfg))
 
     cp = run(cmd + ["--json=short"], capture=True, check=False)
     if cp.returncode == 0:
@@ -1236,34 +1908,82 @@ def pcrlock_predict_pcrs(cfg: Config, dry_run: bool = False) -> Optional[set[int
         except ValueError:
             data = None
         if isinstance(data, dict):
-            pcrs: set[int] = set()
-            for bank in data.values():
-                if not isinstance(bank, list):
-                    continue
+            # The policy uses the SHA-256 bank.  Prefer it over any other bank
+            # the TPM may expose, so values of different lengths are not mixed.
+            sha256_bank = data.get("sha256")
+            if isinstance(sha256_bank, list):
+                banks = [sha256_bank]
+            else:
+                banks = [bank for bank in data.values() if isinstance(bank, list)]
+            values: dict[int, list[str]] = {}
+            for bank in banks:
                 for item in bank:
-                    if isinstance(item, dict) and isinstance(item.get("pcr"), int):
-                        pcrs.add(item["pcr"])
-            return pcrs
+                    if not isinstance(item, dict) or not isinstance(item.get("pcr"), int):
+                        continue
+                    pcr = item["pcr"]
+                    raw_values = item.get("values")
+                    if not isinstance(raw_values, list):
+                        continue
+                    bucket = values.setdefault(pcr, [])
+                    for value in raw_values:
+                        if isinstance(value, str):
+                            bucket.append(value.lower())
+            return values
 
     # Older systemd versions may not support --json; fall back to text output.
     cp = run(cmd, capture=True, check=False)
     if cp.returncode != 0:
         detail = (cp.stderr or cp.stdout or "").strip()
         die(f"systemd-pcrlock predict failed: {detail or f'exit status {cp.returncode}'}")
-    return {
-        int(match.group(1))
-        for match in re.finditer(r"Results for PCR (\d+)", cp.stdout)
-    }
+    values = {}
+    current: Optional[int] = None
+    for line in cp.stdout.splitlines():
+        match = re.search(r"Results for PCR (\d+)", line)
+        if match:
+            current = int(match.group(1))
+            values.setdefault(current, [])
+            continue
+        match = re.search(r"sha256:\s*([0-9a-fA-F]{16,})", line)
+        if match and current is not None:
+            values[current].append(match.group(1).lower())
+    return values
+
+
+def _verify_current_pcr_values(
+    cfg: Config, values_by_pcr: dict[int, list[str]], source: str
+) -> None:
+    """Ensure the current TPM values are among the predicted/policy values."""
+    for pcr in cfg.pcrs:
+        candidates = values_by_pcr.get(pcr)
+        if not candidates:
+            continue
+        current = _tpm_pcr_value(pcr)
+        if current is None:
+            continue
+        if current not in candidates:
+            die(
+                f"{source} for PCR {pcr} does not contain the current TPM value "
+                f"({current}). Refusing to install a policy that cannot unlock this boot. "
+                "See `systemd-pcrlock log`."
+            )
 
 
 def verify_pcrlock_prediction(cfg: Config, dry_run: bool = False) -> None:
-    """Check that PCR 9 can be covered BEFORE make-policy touches the NV index."""
+    """Check the prediction BEFORE make-policy touches the NV index.
+
+    PCR 9 (initrd/cmdline) and PCR 4 (boot loader, when configured) are
+    mandatory.  PCR 4 is generated from the validated event log because some
+    firmware records measurements that `lock-pe` cannot describe.
+    """
     if dry_run:
-        log.info("[dry-run] would verify the pcrlock prediction covers PCR 9")
+        log.info("[dry-run] would verify the pcrlock prediction covers PCR 4 and PCR 9")
         return
-    pcrs = pcrlock_predict_pcrs(cfg)
-    if pcrs is None:
+    if 4 in cfg.pcrs:
+        prepare_pcrlock_components(cfg)
+    values = pcrlock_predict_values(cfg)
+    if values is None:
         return
+    pcrs = set(values)
     log.info("pcrlock prediction covers PCRs: %s", ", ".join(map(str, sorted(pcrs))))
     if 9 not in pcrs:
         die(
@@ -1275,14 +1995,29 @@ def verify_pcrlock_prediction(cfg: Config, dry_run: bool = False) -> None:
             "only measured on measured-OS/UKI boots (use 740 for classic boot). "
             "See `systemd-pcrlock log`."
         )
+    if 4 in cfg.pcrs and 4 not in pcrs:
+        names = ", ".join(str(p) for p in find_bootloader_pe_paths(cfg)) or "none found"
+        die(
+            "PCR 4 (boot loader) is configured but cannot be predicted. "
+            "Refusing to update the TPM policy. The PCR 4 event log could not be "
+            "reproduced from the running boot's measurements and the known boot "
+            f"loader PEs ({names}). Check `systemd-pcrlock log` and "
+            f"{PCRLOCK_PRIVATE_COMPONENTS}."
+        )
+    if 4 in cfg.pcrs:
+        _verify_current_pcr_values(
+            cfg, {4: values.get(4, [])}, "the PCR 4 prediction"
+        )
     if 7 in cfg.pcrs and 7 not in pcrs:
         log.warning(
             "PCR 7 was requested but cannot be covered (Secure Boot disabled or policy changed); "
-            "the policy will bind PCR 9 only"
+            "the policy will bind PCR 9 and any other covered PCRs only"
         )
 
 
-def run_pcrlock_make_policy(cfg: Config, dry_run: bool = False) -> None:
+def run_pcrlock_make_policy(
+    cfg: Config, dry_run: bool = False, *, force: bool = False
+) -> None:
     binary = pcrlock_bin()
     if not binary:
         die("systemd-pcrlock was not found")
@@ -1297,12 +2032,15 @@ def run_pcrlock_make_policy(cfg: Config, dry_run: bool = False) -> None:
         cmd.append(f"--pcr={pcr}")
     if cfg.pcrlock_location:
         cmd.append(f"--location={cfg.pcrlock_location}")
+    cmd.extend(pcrlock_components_args(cfg, dry_run=dry_run))
+    if force:
+        cmd.append("--force")
     run(cmd, dry_run=dry_run)
     if not dry_run and not PCRLOCK_JSON.exists():
         die(f"{PCRLOCK_JSON} was not created by systemd-pcrlock")
 
 
-def pcrlock_policy_pcrs() -> Optional[list[int]]:
+def pcrlock_policy_values() -> Optional[dict[int, list[str]]]:
     try:
         data = json.loads(PCRLOCK_JSON.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1310,18 +2048,33 @@ def pcrlock_policy_pcrs() -> Optional[list[int]]:
     values = data.get("pcrValues")
     if not isinstance(values, list):
         return None
-    pcrs: set[int] = set()
+    result: dict[int, list[str]] = {}
     for item in values:
-        if isinstance(item, dict) and isinstance(item.get("pcr"), int):
-            pcrs.add(item["pcr"])
-    return sorted(pcrs)
+        if not isinstance(item, dict) or not isinstance(item.get("pcr"), int):
+            continue
+        raw_values = item.get("values")
+        if not isinstance(raw_values, list):
+            continue
+        bucket = result.setdefault(item["pcr"], [])
+        for value in raw_values:
+            if isinstance(value, str):
+                bucket.append(value.lower())
+    return result
+
+
+def pcrlock_policy_pcrs() -> Optional[list[int]]:
+    values = pcrlock_policy_values()
+    if values is None:
+        return None
+    return sorted(values)
 
 
 def verify_pcrlock_policy(cfg: Config) -> None:
-    pcrs = pcrlock_policy_pcrs()
-    if pcrs is None:
+    values_by_pcr = pcrlock_policy_values()
+    if values_by_pcr is None:
         die(f"cannot parse {PCRLOCK_JSON}; refusing to enroll an unverifiable policy")
-    log.info("pcrlock policy covers PCRs: %s", ", ".join(map(str, pcrs)))
+    pcrs = set(values_by_pcr)
+    log.info("pcrlock policy covers PCRs: %s", ", ".join(map(str, sorted(pcrs))))
     if 9 not in pcrs:
         die(
             "the generated pcrlock policy does not cover PCR 9 (initrd/kernel cmdline). "
@@ -1330,56 +2083,155 @@ def verify_pcrlock_policy(cfg: Config) -> None:
             f"whether --pcrlock-location={cfg.pcrlock_location} includes components "
             "only measured on measured-OS/UKI boots (use 740 for classic boot)."
         )
+    if 4 in cfg.pcrs and 4 not in pcrs:
+        die(
+            "the generated pcrlock policy does not cover PCR 4 (boot loader) even though "
+            "it was requested. Refusing to enroll an unbound boot loader. "
+            "See `systemd-pcrlock log` and "
+            f"{PCRLOCK_PRIVATE_COMPONENTS}."
+        )
+    _verify_current_pcr_values(
+        cfg, {4: values_by_pcr.get(4, [])}, "the generated pcrlock policy"
+    )
     if 7 in cfg.pcrs and 7 not in pcrs:
         log.warning("PCR 7 was requested but is not in the pcrlock policy; Secure Boot state is not bound")
 
 
-def boot_policy_path(boot: BootPartition) -> Path:
-    return boot.mount / BOOT_POLICY_SUBDIR / BOOT_POLICY_NAME
+def verify_boot_credential(
+    cfg: Config, dry_run: bool = False, *, verify_content: bool = True
+) -> None:
+    """Make sure the initrd can find systemd-pcrlock's boot credential.
 
-
-def copy_pcrlock_to_boot(cfg: Config, dry_run: bool = False) -> None:
-    boot = BootPartition(mount=Path(cfg.boot_mount), uuid=cfg.boot_uuid, fstype=cfg.boot_fstype)
-    if not boot.mount.exists():
-        die(f"boot mount {boot.mount} does not exist")
-
-    dest = boot_policy_path(boot)
+    Classic systemd-boot does not pass /loader/credentials to the initrd, so the
+    initrd hook copies it into /run/credentials/@encrypted itself.  The
+    credential must exist and contain the policy we just generated.
+    """
     if dry_run:
-        log.info("[dry-run] would copy %s to %s", PCRLOCK_JSON, dest)
+        log.info("[dry-run] would verify systemd-pcrlock's loader/credentials/pcrlock.*.cred")
+        return
+
+    paths = boot_credential_paths(cfg)
+    if not paths:
+        log.warning(
+            "systemd-pcrlock did not write a boot credential; retrying make-policy with --force"
+        )
+        run_pcrlock_make_policy(cfg, force=True)
+        paths = boot_credential_paths(cfg)
+        verify_content = True
+    if not paths:
+        die(
+            "systemd-pcrlock did not write loader/credentials/pcrlock.*.cred. "
+            "Classic systemd-boot needs this credential to unlock root. "
+            "systemd >= 256 is required; upgrade systemd and re-run."
+        )
+
+    if not verify_content:
+        log.info(
+            "Pcrlock boot credential present: %s (policy unchanged; content not re-checked)",
+            ", ".join(str(p) for p in paths),
+        )
+        return
+
+    sc = systemd_creds_bin()
+    if not sc:
+        log.info(
+            "Pcrlock boot credential present: %s (systemd-creds not found; not content-checked)",
+            ", ".join(str(p) for p in paths),
+        )
+        return
+
+    for attempt in (0, 1):
+        expected = PCRLOCK_JSON.read_text(encoding="utf-8").strip()
+        verified: Optional[Path] = None
+        for path in paths:
+            name = path.name[: -len(".cred")] if path.name.endswith(".cred") else path.name
+            cp = run(
+                [sc, "decrypt", "--allow-null", f"--name={name}", str(path), "-"],
+                capture=True,
+                check=False,
+            )
+            if cp.returncode == 0 and cp.stdout.strip() == expected:
+                verified = path
+                break
+        if verified is not None:
+            log.info("Verified pcrlock boot credential %s", verified)
+            return
+        if attempt == 0:
+            log.warning(
+                "the pcrlock boot credential does not match the current policy; "
+                "retrying make-policy with --force"
+            )
+            run_pcrlock_make_policy(cfg, force=True)
+            paths = boot_credential_paths(cfg)
+            if not paths:
+                break
+
+    die(
+        "the pcrlock boot credential does not contain the current policy "
+        f"({', '.join(str(p) for p in paths)}); refusing to leave the next boot "
+        "with an unusable credential"
+    )
+
+
+def legacy_boot_policy_path(cfg: Config) -> Optional[Path]:
+    if not cfg.boot_mount:
+        return None
+    return Path(cfg.boot_mount) / LEGACY_BOOT_POLICY_SUBDIR / LEGACY_BOOT_POLICY_NAME
+
+
+def refresh_legacy_boot_policy(cfg: Config, dry_run: bool = False) -> None:
+    """Keep a 2.0-style ESP copy fresh until setup migrates the initrd.
+
+    A 2.0 initrd reads /boot/<...>/luksury/pcrlock.json.  If the tool was
+    upgraded and `update` runs before `setup` has rebuilt the initrd, leaving
+    that file stale would break the next boot.
+    """
+    dest = legacy_boot_policy_path(cfg)
+    if dest is None or not dest.exists():
+        return
+    if dry_run:
+        log.info("[dry-run] would refresh legacy ESP policy copy %s", dest)
         return
     if not PCRLOCK_JSON.exists():
         die(f"{PCRLOCK_JSON} does not exist")
     dest.parent.mkdir(parents=True, exist_ok=True)
-
     fd, tmpname = tempfile.mkstemp(prefix=f".{dest.name}.", dir=str(dest.parent))
     tmp = Path(tmpname)
     try:
         with os.fdopen(fd, "wb") as out, PCRLOCK_JSON.open("rb") as src:
             shutil.copyfileobj(src, out)
-            out.flush()
-            try:
-                os.fsync(out.fileno())
-            except OSError:
-                # Some FAT implementations reject fsync; os.sync() below still
-                # flushes the data.
-                pass
         os.chmod(tmp, 0o644)
         os.replace(tmp, dest)
         os.sync()
     finally:
         tmp.unlink(missing_ok=True)
-
     if sha256_file(dest) != sha256_file(PCRLOCK_JSON):
         die(f"copy verification failed for {dest}")
-    log.info("Copied pcrlock policy to %s", dest)
+    log.warning(
+        "refreshed legacy ESP policy copy %s; run `%s setup` to migrate the "
+        "initrd to systemd-pcrlock's credential",
+        dest,
+        PROG,
+    )
+
+
+def remove_legacy_boot_policy(cfg: Config, dry_run: bool = False) -> None:
+    dest = legacy_boot_policy_path(cfg)
+    if dest is None or not dest.exists():
+        return
+    remove_file(dest, dry_run)
+    if not dry_run and dest.parent.exists():
+        try:
+            dest.parent.rmdir()
+        except OSError:
+            pass
 
 
 def install_runtime_policy(dry_run: bool = False) -> None:
-    """Install the policy at the path systemd-cryptsetup searches at boot.
+    """Install the policy where the running system's self-test looks for it.
 
-    The initrd script installs the same path.  Populating it on the running
-    system makes the self-test exercise the policy file/location that the
-    boot path will use, rather than /var/lib/systemd alone.
+    The initrd obtains the same data from systemd-pcrlock's boot credential via
+    /run/credentials/@encrypted, which is not available on the running host.
     """
     if not PCRLOCK_JSON.exists():
         die(f"{PCRLOCK_JSON} does not exist")
@@ -1449,56 +2301,57 @@ def install_self(dry_run: bool = False) -> None:
 
 
 def make_dracut_hook(cfg: Config) -> str:
-    uuid = shlex.quote(cfg.boot_uuid)
-    fstype = shlex.quote(cfg.boot_fstype or "")
+    uuid = shlex.quote(cfg.credential_uuid or cfg.boot_uuid)
+    fstype = shlex.quote(cfg.credential_fstype or cfg.boot_fstype or "")
     fstype_opt = f" -t {fstype}" if fstype else ""
-    policy = f"/run/luksury/{BOOT_POLICY_SUBDIR}/{BOOT_POLICY_NAME}"
-    dest = str(PCRLOCK_RUNTIME)
-    tmp = f"{dest}.tmp"
 
     return (
         "#!/bin/sh\n"
-        "# Generated by luksury.  Make the pcrlock policy available before\n"
-        "# systemd-cryptsetup unlocks the root volume.  This runs as\n"
-        "# ExecStartPre= of systemd-cryptsetup@.service, so it must either\n"
-        "# install the policy or exhaust its retry budget before returning.\n"
+        "# Generated by luksury.  Make systemd-pcrlock's boot credential\n"
+        "# available before systemd-cryptsetup unlocks the root volume.  This\n"
+        "# runs as ExecStartPre= of systemd-cryptsetup@.service, so it must\n"
+        "# either install the credential or exhaust its retry budget.\n"
         "set -u\n"
-        f"POLICY={shlex.quote(policy)}\n"
-        f"DEST={shlex.quote(dest)}\n"
-        f"TMP={shlex.quote(tmp)}\n"
+        "CRED_DIR=/run/credentials/@encrypted\n"
+        "MNT=/run/luksury\n"
         f"UUID={uuid}\n"
         'say() { echo "luksury: $*" > /dev/kmsg 2>/dev/null || true; }\n'
-        "copy_ok() {\n"
-        "    if command -v cmp >/dev/null 2>&1; then\n"
-        '        cmp -s "$POLICY" "$TMP"\n'
-        "    else\n"
-        '        [ "$(wc -c < "$POLICY")" -eq "$(wc -c < "$TMP")" ]\n'
-        "    fi\n"
-        "}\n"
-        'if [ -s "$DEST" ]; then exit 0; fi\n'
-        "mkdir -p /run/luksury /run/systemd\n"
-        "trap 'umount /run/luksury 2>/dev/null || true' 0\n"
+        'if [ -d "$CRED_DIR" ]; then\n'
+        '    for f in "$CRED_DIR"/pcrlock.*; do\n'
+        '        [ -e "$f" ] && exit 0\n'
+        "    done\n"
+        "fi\n"
+        'mkdir -p "$CRED_DIR" "$MNT"\n'
+        'chmod 0700 "$CRED_DIR" 2>/dev/null || true\n'
+        "trap 'umount \"$MNT\" 2>/dev/null || true' 0\n"
         "modprobe -a -q vfat ext4 >/dev/null 2>&1 || true\n"
         "i=0\n"
         'while [ "$i" -lt 10 ]; do\n'
-        '    if [ -s "$DEST" ]; then exit 0; fi\n'
-        "    if mountpoint -q /run/luksury 2>/dev/null || \\\n"
-        f'        mount{fstype_opt} -o ro UUID="$UUID" /run/luksury 2>/dev/null; then\n'
-        '        if [ -s "$POLICY" ]; then\n'
-        '            if cp -f "$POLICY" "$TMP" 2>/dev/null && copy_ok; then\n'
-        '                if mv -f "$TMP" "$DEST"; then\n'
-        "                    umount /run/luksury 2>/dev/null || true\n"
-        '                    say "installed pcrlock policy from boot partition UUID=$UUID"\n'
-        "                    exit 0\n"
-        "                fi\n"
+        "    if mountpoint -q \"$MNT\" 2>/dev/null || \\\n"
+        f'        mount{fstype_opt} -o ro UUID="$UUID" "$MNT" 2>/dev/null; then\n'
+        "        copied=0\n"
+        '        for f in "$MNT"/loader/credentials/pcrlock.*.cred; do\n'
+        '            [ -f "$f" ] || continue\n'
+        '            base=${f##*/}\n'
+        '            name=${base%.cred}\n'
+        '            tmp="$CRED_DIR/.$name.tmp"\n'
+        '            if cp -f "$f" "$tmp" 2>/dev/null && mv -f "$tmp" "$CRED_DIR/$name"; then\n'
+        "                copied=1\n"
+        "            else\n"
+        '                rm -f "$tmp" 2>/dev/null || true\n'
         "            fi\n"
+        "        done\n"
+        '        umount "$MNT" 2>/dev/null || true\n'
+        '        if [ "$copied" -eq 1 ]; then\n'
+        '            say "installed pcrlock credential from boot partition UUID=$UUID"\n'
+        "            exit 0\n"
         "        fi\n"
         "    fi\n"
         "    i=$((i + 1))\n"
         "    sleep 1\n"
         "done\n"
-        "umount /run/luksury 2>/dev/null || true\n"
-        'say "pcrlock policy not found on boot partition UUID=$UUID; falling back to passphrase"\n'
+        'umount "$MNT" 2>/dev/null || true\n'
+        'say "pcrlock credential not found on boot partition UUID=$UUID; falling back to passphrase"\n'
         "exit 1\n"
     )
 
@@ -1507,10 +2360,10 @@ def install_dracut_module(cfg: Config, dry_run: bool = False) -> None:
     if not dracut_bin() and not DRACUT_MODULE_DIR.parent.exists():
         log.info("dracut not found; skipping its initramfs module")
         return
-    if not cfg.boot_uuid:
+    if not (cfg.credential_uuid or cfg.boot_uuid):
         log.warning(
             "boot partition UUID is unknown; the initramfs will not be able to read "
-            "the pcrlock policy from the boot partition"
+            "systemd-pcrlock's boot credential"
         )
 
     module_setup = (
@@ -1518,8 +2371,7 @@ def install_dracut_module(cfg: Config, dry_run: bool = False) -> None:
         "check() { return 0; }\n"
         "depends() { return 0; }\n"
         "install() {\n"
-        "    inst_multiple mount umount mountpoint mkdir cp mv wc sleep modprobe\n"
-        "    inst_multiple -o cmp\n"
+        "    inst_multiple mount umount mountpoint mkdir cp mv rm chmod sleep modprobe\n"
         "    instmods vfat ext4 nls_cp437 nls_iso8859-1\n"
         '    inst_simple "$moddir/luksury_pcrlock.sh" /usr/lib/luksury/luksury_pcrlock.sh\n'
         '    inst_simple "$moddir/luksury-cryptsetup.conf" /usr/lib/systemd/system/systemd-cryptsetup@.service.d/99-luksury.conf\n'
@@ -1573,6 +2425,27 @@ def install_dracut_module(cfg: Config, dry_run: bool = False) -> None:
         remove_file(old_conf, dry_run)
 
     log.info("%s dracut module in %s", "Would install" if dry_run else "Installed", DRACUT_MODULE_DIR)
+
+
+def refresh_boot_update_dropin(dry_run: bool = False) -> None:
+    """Make an existing boot-update drop-in propagate refresh failures."""
+    try:
+        content = BOOT_UPDATE_DROPIN.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if "ExecStartPost=-" not in content:
+        return
+    content = content.replace("ExecStartPost=-", "ExecStartPost=", 1)
+    backup_file(BOOT_UPDATE_DROPIN, dry_run)
+    atomic_write(BOOT_UPDATE_DROPIN, content, 0o644, dry_run)
+    daemon_reload(dry_run)
+    log.info("%s boot-update drop-in to fail on PCR 4 prediction errors", "Would update" if dry_run else "Updated")
+
+
+def daemon_reload(dry_run: bool = False) -> None:
+    if not Path("/run/systemd/system").is_dir():
+        return
+    run(["systemctl", "daemon-reload"], check=False, dry_run=dry_run)
 
 
 def install_update_hooks(dry_run: bool = False) -> list[str]:
@@ -1649,6 +2522,22 @@ def install_update_hooks(dry_run: bool = False) -> list[str]:
         backup_file(PACMAN_HOOK, dry_run)
         atomic_write(PACMAN_HOOK, content, 0o644, dry_run)
         installed.append(str(PACMAN_HOOK))
+
+    # systemd-boot-update.service runs bootctl update early at boot, after root
+    # is unlocked.  Re-lock the newly written boot loader immediately so PCR 4
+    # still matches on the next boot.
+    boot_update_unit = Path("/usr/lib/systemd/system/systemd-boot-update.service")
+    if not boot_update_unit.exists():
+        boot_update_unit = Path("/lib/systemd/system/systemd-boot-update.service")
+    if boot_update_unit.exists():
+        content = (
+            "[Service]\n"
+            f"ExecStartPost={luksury} refresh-bootloader\n"
+        )
+        backup_file(BOOT_UPDATE_DROPIN, dry_run)
+        atomic_write(BOOT_UPDATE_DROPIN, content, 0o644, dry_run)
+        installed.append(str(BOOT_UPDATE_DROPIN))
+        daemon_reload(dry_run)
 
     if not installed:
         log.warning(
@@ -1775,6 +2664,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
     cfg.mode = args.mode
     cfg.pcrlock_location = args.pcrlock_location
     cfg.lock_gpt = args.lock_gpt
+    for raw in getattr(args, "bootloader_pe", []):
+        path = Path(raw)
+        if not path.is_file():
+            die(f"boot loader PE not found: {path}")
+        cfg.bootloader_pes.append(str(path.resolve()))
     if (
         cfg.mode in ("auto", "pcrlock")
         and not ("720-kernel-initrd" < cfg.pcrlock_location < "750")
@@ -1810,6 +2704,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "PCR 9 covers the kernel cmdline/initrd; remove 12."
         )
 
+    if (
+        cfg.mode == "pcrlock"
+        and 4 in cfg.pcrs
+        and cfg.pcrlock_location < PCRLOCK_BOOTLOADER_COMPONENT
+    ):
+        log.warning(
+            "pcrlock location %s excludes %s; PCR 4 will not be covered",
+            cfg.pcrlock_location,
+            PCRLOCK_BOOTLOADER_COMPONENT,
+        )
+
     dev, name = find_root_luks()
     check_luks2(dev)
     cfg.luks_device = str(dev)
@@ -1833,6 +2738,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
         boot.uuid,
         boot.fstype or "?",
         boot.device or "?",
+    )
+
+    credential = find_credential_partition()
+    if credential is None or not credential.uuid:
+        log.warning(
+            "cannot determine the $BOOT credential partition UUID; falling back to the "
+            "boot-entry partition %s",
+            boot.mount,
+        )
+        credential = boot
+    cfg.credential_mount = str(credential.mount)
+    cfg.credential_uuid = credential.uuid
+    cfg.credential_fstype = credential.fstype
+    log.info(
+        "Credential partition: %s (UUID=%s)",
+        credential.mount,
+        credential.uuid,
     )
 
     entry = find_default_entry(boot)
@@ -1948,7 +2870,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     try:
         if cfg.mode == "pcrlock":
             assert target_initrd is not None
-            keep_initrd, keep_cmdline, can_prune = run_pcrlock_locks(
+            keep_initrd, keep_cmdline, keep_bootloader, can_prune = run_pcrlock_locks(
                 target_initrd,
                 cmdline_file,
                 cfg,
@@ -1960,8 +2882,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
             run_pcrlock_make_policy(cfg, dry_run=args.dry_run)
             if not args.dry_run:
                 verify_pcrlock_policy(cfg)
+                verify_boot_credential(cfg)
             prune_variants_after_success(
-                keep_initrd, keep_cmdline, can_prune, dry_run=args.dry_run
+                keep_initrd,
+                keep_cmdline,
+                keep_bootloader,
+                can_prune,
+                dry_run=args.dry_run,
             )
         elif cfg.mode == "literal":
             log.warning(
@@ -1990,8 +2917,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     set_crypttab_tpm(dev, cfg, remove=False, dry_run=args.dry_run)
 
     if cfg.mode == "pcrlock":
-        copy_pcrlock_to_boot(cfg, args.dry_run)
         install_runtime_policy(args.dry_run)
+        # The rebuilt initrd consumes systemd-pcrlock's credential now, so the
+        # 2.0-style ESP copy is no longer needed.
+        remove_legacy_boot_policy(cfg, args.dry_run)
 
     save_config(cfg, args.dry_run)
 
@@ -2188,7 +3117,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         log.info("Refreshing luksury policy for initrd=%s cmdline=%s", initrd, cmdline)
 
         if cfg.mode == "pcrlock":
-            keep_initrd, keep_cmdline, can_prune = run_pcrlock_locks(
+            keep_initrd, keep_cmdline, keep_bootloader, can_prune = run_pcrlock_locks(
                 initrd,
                 cmdline,
                 cfg,
@@ -2197,13 +3126,27 @@ def cmd_update(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
             )
             verify_pcrlock_prediction(cfg, dry_run=args.dry_run)
+            old_policy: Optional[str] = None
+            try:
+                old_policy = PCRLOCK_JSON.read_text(encoding="utf-8")
+            except OSError:
+                pass
             run_pcrlock_make_policy(cfg, args.dry_run)
             if not args.dry_run:
+                try:
+                    policy_changed = PCRLOCK_JSON.read_text(encoding="utf-8") != old_policy
+                except OSError:
+                    policy_changed = True
                 verify_pcrlock_policy(cfg)
+                verify_boot_credential(cfg, verify_content=policy_changed)
+                refresh_legacy_boot_policy(cfg)
             prune_variants_after_success(
-                keep_initrd, keep_cmdline, can_prune, dry_run=args.dry_run
+                keep_initrd,
+                keep_cmdline,
+                keep_bootloader,
+                can_prune,
+                dry_run=args.dry_run,
             )
-            copy_pcrlock_to_boot(cfg, args.dry_run)
             install_runtime_policy(args.dry_run)
             log.info("pcrlock policy refreshed; no LUKS re-enrollment needed")
         elif cfg.mode == "literal":
@@ -2217,6 +3160,60 @@ def cmd_update(args: argparse.Namespace) -> int:
     finally:
         for path in temporary:
             path.unlink(missing_ok=True)
+    if cfg.mode == "pcrlock":
+        refresh_boot_update_dropin(args.dry_run)
+    save_config(cfg, args.dry_run)
+    return 0
+
+
+def cmd_refresh_bootloader(args: argparse.Namespace) -> int:
+    """Refresh the PCR 4 prediction and policy after a boot loader update.
+
+    Called by the systemd-boot-update.service drop-in.  The initrd/cmdline
+    components from the last setup/update are still valid, but the PCR 4
+    component is rebuilt from the current event log so a policy created
+    without PCR 4 is repaired as well.
+    """
+    require_root()
+    cfg = load_config(required=True)
+    assert cfg is not None
+    if cfg.mode != "pcrlock":
+        return 0
+
+    keep_bootloader: set[Path] = set()
+    new_variant = False
+    for pe in find_bootloader_pe_paths(cfg):
+        if not pe_variant_path(pe).exists():
+            new_variant = True
+        keep_bootloader.add(_write_pe_variant(pe, args.dry_run))
+
+    # When PCR 4 is configured, always rebuild the event-log-derived component
+    # and policy, even if no new PE was installed.  This repairs policies created
+    # by an older luksury that skipped PCR 4, and keeps the candidate set for the
+    # next boot loader update current.
+    if not new_variant and 4 not in cfg.pcrs and not args.dry_run:
+        log.info("boot loader PCR 4 variants are up to date")
+        return 0
+
+    old_policy: Optional[str] = None
+    try:
+        old_policy = PCRLOCK_JSON.read_text(encoding="utf-8")
+    except OSError:
+        pass
+
+    verify_pcrlock_prediction(cfg, dry_run=args.dry_run)
+    run_pcrlock_make_policy(cfg, args.dry_run)
+    if not args.dry_run:
+        try:
+            policy_changed = PCRLOCK_JSON.read_text(encoding="utf-8") != old_policy
+        except OSError:
+            policy_changed = True
+        verify_pcrlock_policy(cfg)
+        verify_boot_credential(cfg, verify_content=policy_changed)
+        prune_bootloader_variants(keep_bootloader)
+        install_runtime_policy(args.dry_run)
+        log.info("boot loader PCR 4 policy refreshed")
+    refresh_boot_update_dropin(args.dry_run)
     return 0
 
 
@@ -2249,6 +3246,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"Mode:             {cfg.mode}")
         print(f"Configured PCRs:  {', '.join(map(str, cfg.pcrs))}")
         print(f"Boot partition:   {cfg.boot_mount} (UUID={cfg.boot_uuid or '?'}, {cfg.boot_fstype or '?'})")
+        print(
+            f"Credential part.: {cfg.credential_mount or cfg.boot_mount} "
+            f"(UUID={cfg.credential_uuid or cfg.boot_uuid or '?'})"
+        )
         print(f"Kernel version:   {cfg.kernel_version or '?'}")
         print(f"Initrd:           {cfg.initrd or '?'}")
         print(f"Cmdline:          {cfg.cmdline or '?'}")
@@ -2265,6 +3266,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print(f"pcrlock policy:   {PCRLOCK_JSON} (missing)")
 
+    if cfg and cfg.mode == "pcrlock" and 4 in cfg.pcrs:
+        state = "present" if PCRLOCK_PRIVATE_COMPONENTS.is_dir() else "missing"
+        print(f"PCR 4 components: {PCRLOCK_PRIVATE_COMPONENTS} ({state})")
+
     if PCRLOCK_RUNTIME.exists():
         if PCRLOCK_JSON.exists():
             match = "match" if sha256_file(PCRLOCK_RUNTIME) == sha256_file(PCRLOCK_JSON) else "MISMATCH"
@@ -2272,15 +3277,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             match = "unknown"
         print(f"Runtime policy:   {PCRLOCK_RUNTIME} ({match})")
     else:
-        print(f"Runtime policy:   {PCRLOCK_RUNTIME} (missing; installed by the initrd)")
+        print(f"Runtime policy:   {PCRLOCK_RUNTIME} (missing; installed for the self-test)")
 
-    if cfg and cfg.boot_mount:
-        boot_copy = boot_policy_path(BootPartition(Path(cfg.boot_mount), cfg.boot_uuid, cfg.boot_fstype))
-        if boot_copy.exists() and PCRLOCK_JSON.exists():
-            match = "match" if sha256_file(boot_copy) == sha256_file(PCRLOCK_JSON) else "MISMATCH"
-            print(f"Boot policy copy: {boot_copy} ({match})")
+    if cfg and (cfg.credential_mount or cfg.boot_mount):
+        credentials = boot_credential_paths(cfg)
+        if credentials:
+            for credential in credentials:
+                print(f"Boot credential:  {credential}")
         else:
-            print(f"Boot policy copy: {boot_copy} (missing)")
+            print(
+                "Boot credential:  missing "
+                "(expected $BOOT/loader/credentials/pcrlock.*.cred from systemd-pcrlock)"
+            )
 
     hooks = {
         "kernel-install": KERNEL_INSTALL_HOOK,
@@ -2288,6 +3296,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "pacman": PACMAN_HOOK,
         "dracut module": DRACUT_MODULE_DIR / "module-setup.sh",
         "dracut conf": DRACUT_CONF,
+        "boot update": BOOT_UPDATE_DROPIN,
     }
     print("Hooks:")
     for label, path in hooks.items():
@@ -2354,14 +3363,28 @@ def cmd_remove(args: argparse.Namespace) -> int:
     remove_file(DRACUT_CONF, args.dry_run)
     remove_file(Path("/usr/lib/dracut/dracut.conf.d/80-luksury.conf"), args.dry_run)
     remove_file(PCRLOCK_RUNTIME, args.dry_run)
+    remove_tree(PCRLOCK_PRIVATE_COMPONENTS, args.dry_run)
+    remove_file(BOOT_UPDATE_DROPIN, args.dry_run)
+    if not args.dry_run and BOOT_UPDATE_DROPIN.parent.exists():
+        try:
+            BOOT_UPDATE_DROPIN.parent.rmdir()
+        except OSError:
+            pass
+    daemon_reload(args.dry_run)
 
     if cfg.boot_mount:
-        boot_copy = boot_policy_path(BootPartition(Path(cfg.boot_mount), cfg.boot_uuid, cfg.boot_fstype))
-        remove_file(boot_copy, args.dry_run)
+        # luksury <= 2.0 wrote its own policy copy here.  Remove it on upgrade
+        # or uninstall; 2.1 uses systemd-pcrlock's loader/credentials instead.
+        legacy = (
+            Path(cfg.boot_mount)
+            / LEGACY_BOOT_POLICY_SUBDIR
+            / LEGACY_BOOT_POLICY_NAME
+        )
+        remove_file(legacy, args.dry_run)
         # Remove the directory only if it is empty.
-        if not args.dry_run and boot_copy.parent.exists():
+        if not args.dry_run and legacy.parent.exists():
             try:
-                boot_copy.parent.rmdir()
+                legacy.parent.rmdir()
             except OSError:
                 pass
 
@@ -2397,7 +3420,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
         log.info(
             "Leaving the current initrd unchanged. It still contains the luksury hook "
             "until the next kernel/initrd rebuild; the hook is harmless because the "
-            "policy is gone. Rebuild explicitly with --rebuild-initramfs if desired."
+            "TPM token is gone. Rebuild explicitly with --rebuild-initramfs if desired."
         )
 
     print(
@@ -2446,13 +3469,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="pcrlock is update-safe; literal is a fallback for old TPMs",
     )
-    p.add_argument("--pcrs", help="comma/plus-separated PCR list (default: 7,9 for pcrlock; 7,9,12 for literal)")
+    p.add_argument(
+        "--pcrs",
+        help="comma/plus-separated PCR list (default: 4,7,9 for pcrlock; 4,7,9,12 for literal)",
+    )
     p.add_argument(
         "--pcrlock-location",
         default=DEFAULT_PCRLOCK_LOCATION,
         help="systemd-pcrlock make-policy --location (default 740 for classic boot)",
     )
     p.add_argument("--lock-gpt", action="store_true", help="also lock the GPT (PCR 5)")
+    p.add_argument(
+        "--bootloader-pe",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="additional boot loader PE to lock to PCR 4 (may be repeated)",
+    )
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("update", help="refresh the pcrlock policy after an initrd/kernel update")
@@ -2460,6 +3493,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cmdline", type=Path, help="file containing the new kernel command line")
     p.add_argument("--kernel", help="kernel version (find /boot/initrd.img-VERSION)")
     p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser(
+        "refresh-bootloader",
+        help="re-lock a newly installed boot loader for PCR 4 (used by the boot-update hook)",
+    )
+    p.set_defaults(func=cmd_refresh_bootloader)
 
     p = sub.add_parser("status", help="show the current configuration")
     p.set_defaults(func=cmd_status)
@@ -2483,7 +3522,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_logging(args.verbose, log_to_file=(os.geteuid() == 0))
 
     try:
-        if args.command in ("setup", "update", "remove"):
+        if args.command in ("setup", "update", "refresh-bootloader", "remove"):
             with FileLock():
                 return int(args.func(args))
         return int(args.func(args))
