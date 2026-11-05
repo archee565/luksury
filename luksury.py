@@ -19,8 +19,8 @@ and a kernel without any dpkg checksum is never embedded.
 
 Run as root:
 
-    sudo ./kvikuki.py --dry-run
-    sudo ./kvikuki.py
+    sudo ./luksury.py --dry-run
+    sudo ./luksury.py
 
 The first real run is a bootstrap: it requires UEFI.  Secure Boot is
 optional.  It creates or reuses a UKI code-signing key.  When Secure Boot is
@@ -37,7 +37,7 @@ path as optional load data.  The post-update hook builds and signs the UKI.
 Later initrd updates use the same hook; only that hook creates a UKI.  The
 script does not modify GRUB or systemd-boot configuration.  A queued MOK
 enrollment must be confirmed in MokManager on the next boot with the fixed
-password "kvikuki"; kvikuki never reboots the machine automatically.
+password "luksury"; luksury never reboots the machine automatically.
 
 A dracut-based system is required.  Dracut produces a single initrd with the
 early microcode archive already included, so the default entry must have
@@ -90,7 +90,7 @@ nvpcr-anchor.<entry-token>.cred.  Other credentials, command-line addons and
 configuration extensions add measurements that are not predicted, so they are
 rejected.  If the anchor is missing on systemd 259 or later, the next boot may
 create it and change PCR12; the script warns that the TPM token will stop
-unlocking and the passphrase will be requested, and that rerunning kvikuki
+unlocking and the passphrase will be requested, and that rerunning luksury
 after the reboot re-enrolls with the anchor.  The root crypttab entry is
 updated with tpm2-device=auto, tpm2-measure-pcr=15 and
 tpm2-measure-bank=sha256.
@@ -101,11 +101,11 @@ present; without it the initrd has no libtss2 and cannot unlock the volume,
 so the requirements are checked before any token is enrolled.
 
 The bootstrap itself does not build a UKI.  A real "install" only bootstraps the
-installation, writes /var/lib/kvikuki/install-options.json, installs the
+installation, writes /var/lib/luksury/install-options.json, installs the
 initramfs post-update hook, creates the EFI boot entry when needed, updates the
 root crypttab entry and prepares the recovery key.  It then regenerates the
 default entry's initrd with update-initramfs; the post-update hook calls
-"kvikuki --hook-rebuild", which is the only code path that builds, signs and
+"luksury --hook-rebuild", which is the only code path that builds, signs and
 installs a UKI.  The same hook is used for later initrd regenerations.  The
 hook's initrd path is used only to check that it is the default entry's
 initrd; the UKI is built from that generated file.  The initrd is confined to
@@ -123,21 +123,21 @@ Rerun the installer after a shim-signed or Secure Boot policy update, or after
 enabling or disabling Secure Boot, so the TPM token is bound to the new values.
 
 Before re-enrolling the TPM2 token the script checks the recovery key in
-/var/lib/kvikuki/recovery.key (mode 0600).  It is generated once, during the
+/var/lib/luksury/recovery.key (mode 0600).  It is generated once, during the
 first enrollment, and is never replaced.  If it is later missing or no
 longer unlocks the volume, the script stops rather than creating a new one.
 That key authorizes later PCR updates.  The recovery key is never printed.
 
-The enrolled TPM2 token is recorded in /var/lib/kvikuki/tpm2-state.json
+The enrolled TPM2 token is recorded in /var/lib/luksury/tpm2-state.json
 (mode 0600).  Every install removes all existing systemd-tpm2 tokens and
 keyslots before enrolling the new token, so no stale or weak TPM2 enrollment
 can keep unlocking the volume.
 
 A real install installs the update hook automatically.  It copies itself to
-/usr/local/sbin/kvikuki, installs a bash wrapper below
-/usr/local/lib/kvikuki, and installs only the initramfs post-update hook below
+/usr/local/sbin/luksury, installs a bash wrapper below
+/usr/local/lib/luksury, and installs only the initramfs post-update hook below
 /etc/initramfs/post-update.d.  There is no systemd path unit, timer or kernel
-postinst trigger.  The hook calls "kvikuki --hook-rebuild", which rebuilds and
+postinst trigger.  The hook calls "luksury --hook-rebuild", which rebuilds and
 signs the UKI only when the generated initrd belongs to the default boot
 entry.  It verifies that python3, dracut and the required commands are present
 and otherwise skips with a warning.  A dry run never installs the hook,
@@ -145,15 +145,15 @@ regenerates an initrd or creates a UKI.
 
 To undo the installation, run:
 
-    sudo ./kvikuki.py remove --dry-run
-    sudo ./kvikuki.py remove
+    sudo ./luksury.py remove --dry-run
+    sudo ./luksury.py remove
 
 This removes the UKI, the private shim copy, its EFI boot entries, the update
 hook, the installed copy in /usr/local, all systemd-tpm2 enrollments, the
 recovery key itself
 (using cryptsetup luksRemoveKey) and its token, the tpm2-* options in the root
 crypttab entry, the install options and the state files under
-/var/lib/kvikuki.  The MOK signing key and its MOK enrollment are left in
+/var/lib/luksury.  The MOK signing key and its MOK enrollment are left in
 place, because deleting them requires a separate MokManager deletion and a
 reboot; remove them manually with 'mokutil --delete' if desired.  It refuses
 to remove the last usable LUKS keyslot and verifies an alternative unlock
@@ -184,13 +184,13 @@ from pathlib import Path
 from typing import BinaryIO
 
 ESP_DEFAULT = Path("/boot/efi")
-EFI_NAME = "kvikuki.efi"
+EFI_NAME = "luksury.efi"
 SHIM_NAME = "shimx64.efi"
 MMX_NAME = "mmx64.efi"
 # shim resolves its default second stage relative to its own directory.  The
 # UKI therefore needs a private copy of shim and this fixed second-stage name;
 # relying on the boot entry's optional data is firmware-dependent.
-SHIM_DIR_NAME = "kvikuki"
+SHIM_DIR_NAME = "luksury"
 SECOND_STAGE_NAME = "grubx64.efi"
 STUB_DEFAULT = Path("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")
 SHIM_SIGNED_DEFAULT = Path("/usr/lib/shim/shimx64.efi.signed")
@@ -260,7 +260,7 @@ CRYPTTAB_TPM2_OPTIONS = (
     "tpm2-measure-pcr",
     "tpm2-measure-bank",
 )
-CRYPTTAB_BACKUP_SUFFIX = ".kvikuki.bak"
+CRYPTTAB_BACKUP_SUFFIX = ".luksury.bak"
 
 
 def cryptenroll_pcrs(secure_boot: bool) -> tuple[int, ...]:
@@ -272,19 +272,19 @@ def cryptenroll_pcrs(secure_boot: bool) -> tuple[int, ...]:
     )
 
 
-RECOVERY_KEY_FILE = Path("/var/lib/kvikuki/recovery.key")
-TPM2_STATE_FILE = Path("/var/lib/kvikuki/tpm2-state.json")
+RECOVERY_KEY_FILE = Path("/var/lib/luksury/recovery.key")
+TPM2_STATE_FILE = Path("/var/lib/luksury/tpm2-state.json")
 TPM2_STATE_VERSION = 1
-MOK_KEY_FILE = Path("/var/lib/kvikuki/mok.key")
-MOK_CERT_FILE = Path("/var/lib/kvikuki/mok.crt")
-MOK_DER_FILE = Path("/var/lib/kvikuki/mok.der")
+MOK_KEY_FILE = Path("/var/lib/luksury/mok.key")
+MOK_CERT_FILE = Path("/var/lib/luksury/mok.crt")
+MOK_DER_FILE = Path("/var/lib/luksury/mok.der")
 # MokManager always requires a password to authorize a queued enrollment.  A
 # fixed, publicly documented password avoids generating or storing a secret.
-MOK_PASSWORD = "kvikuki"
-MOK_PASSWORD_HASH_FILE = Path("/var/lib/kvikuki/mok-password.hash")
+MOK_PASSWORD = "luksury"
+MOK_PASSWORD_HASH_FILE = Path("/var/lib/luksury/mok-password.hash")
 # Password file written by older versions that generated a random password.
-LEGACY_MOK_PASSWORD_FILE = Path("/var/lib/kvikuki/mok-password")
-MOK_SUBJECT = "/CN=kvikuki UKI signing key/"
+LEGACY_MOK_PASSWORD_FILE = Path("/var/lib/luksury/mok-password")
+MOK_SUBJECT = "/CN=luksury UKI signing key/"
 MOK_CERT_DAYS = 3650
 SIGNATURE_SLACK = 64 * 1024
 # dracut only includes its tpm2-tss module when the tpm2 command from
@@ -299,7 +299,7 @@ TPM2_REQUIRED_LIBRARIES = (
     ("tss2-esys", "libtss2-esys.so.0"),
     ("tss2-tcti-device", "libtss2-tcti-device.so.0"),
 )
-INSTALL_OPTIONS_FILE = Path("/var/lib/kvikuki/install-options.json")
+INSTALL_OPTIONS_FILE = Path("/var/lib/luksury/install-options.json")
 INSTALL_OPTIONS_VERSION = 1
 # Leading bytes of the initrd formats we are willing to copy.  This is a
 # sanity check, not a trust anchor; it keeps the build from accidentally
@@ -321,14 +321,14 @@ INITRD_MAGIC = (
 BOOT_ROOTS_EXTRA = (Path("/boot"), Path("/efi"), ESP_DEFAULT)
 SYSTEMD_TPM2_TOKEN = "systemd-tpm2"
 SYSTEMD_RECOVERY_TOKEN = "systemd-recovery"
-INSTALL_BIN = Path("/usr/local/sbin/kvikuki")
-INSTALL_LIB_DIR = Path("/usr/local/lib/kvikuki")
+INSTALL_BIN = Path("/usr/local/sbin/luksury")
+INSTALL_LIB_DIR = Path("/usr/local/lib/luksury")
 HOOK_PATH = INSTALL_LIB_DIR / "hook.sh"
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 INITRAMFS_POST_UPDATE_DIR = Path("/etc/initramfs/post-update.d")
 KERNEL_POSTINST_DIR = Path("/etc/kernel/postinst.d")
 TRUSTED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-BUILD_LOCK_FILE = Path("/run/kvikuki.lock")
+BUILD_LOCK_FILE = Path("/run/luksury.lock")
 NON_INTERACTIVE = False
 # systemd's recovery keys are 8 groups of eight modhex characters.
 RECOVERY_KEY_RE = re.compile(
@@ -422,9 +422,9 @@ def sanitize_environment() -> None:
         "ENV",
         "GLOBIGNORE",
         "IFS",
-        "KVIKUKI_BIN",
-        "KVIKUKI_HOOK_ACTIVE",
-        "KVIKUKI_LOCK_FILE",
+        "LUKSURY_BIN",
+        "LUKSURY_HOOK_ACTIVE",
+        "LUKSURY_LOCK_FILE",
         "LD_AUDIT",
         "LD_DEBUG",
         "LD_LIBRARY_PATH",
@@ -1284,7 +1284,7 @@ def resolve_grub_boot(esp: Path | None = None) -> ResolvedBoot:
     if len(initrd_paths) != 1:
         raise UkiError(
             f"default GRUB entry {entry.title!r} has {len(initrd_paths)} "
-            "initrds; kvikuki requires a dracut single-initrd entry"
+            "initrds; luksury requires a dracut single-initrd entry"
         )
     return ResolvedBoot(
         loader="GRUB",
@@ -1941,7 +1941,7 @@ def is_boot_chain_file_name(name: str) -> bool:
 
 
 def is_boot_chain_path(path: str | None) -> bool:
-    """Return True for shim, GRUB, systemd-boot or a kvikuki UKI path."""
+    """Return True for shim, GRUB, systemd-boot or a luksury UKI path."""
     if not path:
         return False
     name = path.replace("/", "\\").rsplit("\\", 1)[-1]
@@ -2307,7 +2307,7 @@ def validate_signing_key_pair(key: Path, cert: Path) -> None:
         raise UkiError(f"cannot read signing key {key}: {exc}") from exc
     if "ENCRYPTED" in key_head:
         raise UkiError(
-            f"signing key {key} is encrypted; kvikuki requires an "
+            f"signing key {key} is encrypted; luksury requires an "
             "unencrypted key for non-interactive signing"
         )
     if certificate_is_expired(cert):
@@ -2389,7 +2389,7 @@ def _write_public_file(path: Path, data: bytes, mode: int = 0o644) -> None:
 def generate_signing_material() -> SigningMaterial:
     """Generate a dedicated MOK code-signing key and certificate."""
     require_tool("openssl")
-    workdir = Path(tempfile.mkdtemp(prefix="kvikuki-mok-"))
+    workdir = Path(tempfile.mkdtemp(prefix="luksury-mok-"))
     key_tmp = workdir / "mok.key"
     cert_tmp = workdir / "mok.crt"
     try:
@@ -2455,7 +2455,7 @@ def import_mok_certificate(
 ) -> None:
     """Queue a certificate for enrollment in MokManager at the next boot.
 
-    MokManager requires a password for the request; kvikuki uses a fixed one
+    MokManager requires a password for the request; luksury uses a fixed one
     so no secret is generated or stored.
     """
     if _pending_mok_contains(cert_der):
@@ -2465,7 +2465,7 @@ def import_mok_certificate(
     if pending:
         raise UkiError(
             "a different MOK enrollment is already pending; complete it or "
-            "run 'mokutil --revoke-import' before installing kvikuki"
+            "run 'mokutil --revoke-import' before installing luksury"
         )
     if dry_run:
         log("would queue the MOK signing certificate for enrollment")
@@ -2503,7 +2503,7 @@ def import_mok_certificate(
             "mokutil reported success but the certificate is not present in "
             "MokNew; refusing to continue"
         )
-    log("queued the kvikuki MOK certificate for enrollment")
+    log("queued the luksury MOK certificate for enrollment")
     log(f"MOK certificate SHA-256: {fingerprint}")
     log(f"MOK enrollment password: {MOK_PASSWORD}")
 
@@ -2519,7 +2519,7 @@ def _cleanup_mok_password() -> None:
 
 
 def revoke_pending_mok_request(*, dry_run: bool = False) -> None:
-    """Cancel a pending kvikuki MOK request when it is the only one."""
+    """Cancel a pending luksury MOK request when it is the only one."""
     if not MOK_CERT_FILE.is_file():
         return
     try:
@@ -2535,29 +2535,29 @@ def revoke_pending_mok_request(*, dry_run: bool = False) -> None:
         return
     if len(pending) != len(ours):
         warn(
-            "other MOK enrollments are pending; leaving the kvikuki MOK "
+            "other MOK enrollments are pending; leaving the luksury MOK "
             "request in place"
         )
         return
     if shutil.which("mokutil") is None:
         if not dry_run:
             warn(
-                "mokutil is not installed; the pending kvikuki MOK "
+                "mokutil is not installed; the pending luksury MOK "
                 "enrollment request remains queued"
             )
         return
     if dry_run:
-        log("would revoke the pending kvikuki MOK enrollment request")
+        log("would revoke the pending luksury MOK enrollment request")
         return
     result = run(["mokutil", "--revoke-import"], check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         warn(
-            "cannot revoke the pending kvikuki MOK enrollment request"
+            "cannot revoke the pending luksury MOK enrollment request"
             + (f": {detail}" if detail else "")
         )
         return
-    log("revoked the pending kvikuki MOK enrollment request")
+    log("revoked the pending luksury MOK enrollment request")
     _cleanup_mok_password()
 
 
@@ -2569,12 +2569,12 @@ def mok_pending_instructions(
     log(f"MOK enrollment password: {MOK_PASSWORD}")
     if secure_boot:
         log(
-            "reboot to enroll the kvikuki signing certificate in MokManager; "
+            "reboot to enroll the luksury signing certificate in MokManager; "
             "the TPM token is bound to the post-enrollment PCR7 value"
         )
     else:
         log(
-            "reboot to enroll the kvikuki signing certificate in MokManager; "
+            "reboot to enroll the luksury signing certificate in MokManager; "
             "Secure Boot is disabled, so the TPM token does not bind PCR7"
         )
 
@@ -2611,7 +2611,7 @@ def ensure_signing_material(
             "MokNew", SHIM_LOCK_GUID
         ):
             raise UkiError(
-                "a MOK enrollment is already pending but the kvikuki "
+                "a MOK enrollment is already pending but the luksury "
                 "signing key/certificate is missing; restore them or run "
                 "'mokutil --revoke-import' before generating a new key"
             )
@@ -2700,14 +2700,14 @@ def _record_file_name(record: TcgEvent) -> str | None:
     return device_path_file_name(record.event_data)
 
 
-def boot_used_kvikuki_uki(
+def boot_used_luksury_uki(
     records: list[TcgEvent] | None = None,
     *,
     uki: Path | None = None,
     algorithm: str = "sha256",
     expected_path: str | None = None,
 ) -> bool:
-    """Return True when the current boot loaded a kvikuki UKI.
+    """Return True when the current boot loaded a luksury UKI.
 
     When ``uki`` is supplied, identify it by its PE digest (or, without an
     event log, by its full ``StubImageIdentifier`` path).  The fallback by
@@ -3030,7 +3030,7 @@ def precompute_pcr12(
             "the systemd NvPCR anchor credential is missing from "
             f"{esp / 'loader' / 'credentials'}; PCR12 will change when the "
             "next boot creates it. The TPM token will then stop unlocking "
-            "and the LUKS passphrase will be requested. Rerun kvikuki after "
+            "and the LUKS passphrase will be requested. Rerun luksury after "
             "the reboot to re-enroll PCR12"
         )
 
@@ -3087,7 +3087,7 @@ def precompute_pcr7(
             )
             same_signer = check.returncode == 0
         if (
-            boot_used_kvikuki_uki(
+            boot_used_luksury_uki(
                 uki=current_uki,
                 algorithm=algorithm,
                 expected_path=expected_path,
@@ -3096,7 +3096,7 @@ def precompute_pcr7(
         ):
             warn(
                 "cannot read the firmware event log; using the current PCR7 "
-                "because this boot already used a kvikuki UKI signed by the "
+                "because this boot already used a luksury UKI signed by the "
                 "same certificate"
             )
             return Pcr7Prediction(
@@ -3104,7 +3104,7 @@ def precompute_pcr7(
             )
         raise UkiError(
             "cannot read the firmware event log and the current boot did "
-            "not use a kvikuki UKI signed by this certificate; refusing to "
+            "not use a luksury UKI signed by this certificate; refusing to "
             "predict PCR7"
         ) from None
 
@@ -3120,7 +3120,7 @@ def precompute_pcr7(
             )
             same_signer = check.returncode == 0
         if (
-            boot_used_kvikuki_uki(
+            boot_used_luksury_uki(
                 records,
                 uki=current_uki,
                 algorithm=algorithm,
@@ -3130,7 +3130,7 @@ def precompute_pcr7(
         ):
             warn(
                 "PCR7 event-log replay does not match the current value; "
-                "using the current PCR7 because this boot used a kvikuki UKI "
+                "using the current PCR7 because this boot used a luksury UKI "
                 "signed by the same certificate"
             )
             return Pcr7Prediction(
@@ -3259,13 +3259,13 @@ def next_boot_tpm2_pcrs(
                 pcr7_value = extend_pcr(pcr7_value, separator, algorithm)
         else:
             # precompute_pcr7 only returns the current value when this boot
-            # used a kvikuki UKI, so it already includes this boot's
+            # used a luksury UKI, so it already includes this boot's
             # separator.
             if current_separator != target_separator:
                 raise UkiError(
                     "cannot reuse the current PCR7 value because the next "
                     "boot changes the systemd os-separator measurement; boot "
-                    "the kvikuki UKI before enrolling"
+                    "the luksury UKI before enrolling"
                 )
         values[7] = pcr7_value
 
@@ -3289,7 +3289,7 @@ def sign_uki(
             f"{unsigned} already has a certificate table; refusing to add a "
             "second signature"
         )
-    signed = workdir / "kvikuki-signed.efi"
+    signed = workdir / "luksury-signed.efi"
     run(
         [
             sbsign,
@@ -3383,7 +3383,7 @@ def require_dracut(update_initramfs: str | None = None) -> str:
     """Require a dracut-based initramfs generator and return update-initramfs."""
     if shutil.which("dracut") is None and not os.path.isfile("/usr/bin/dracut"):
         raise UkiError(
-            "dracut is required; kvikuki only supports dracut-based initrds"
+            "dracut is required; luksury only supports dracut-based initrds"
         )
 
     update = update_initramfs or require_tool(
@@ -3396,7 +3396,7 @@ def require_dracut(update_initramfs: str | None = None) -> str:
     version = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
     if "dracut" not in version:
         raise UkiError(
-            "update-initramfs is not the dracut wrapper; kvikuki requires a "
+            "update-initramfs is not the dracut wrapper; luksury requires a "
             "dracut-based system"
         )
     return update
@@ -3494,7 +3494,7 @@ def target_uses_os_separator(cmdline: list[str]) -> bool:
     """Return whether the next measured UKI boot will extend the os-separator.
 
     The unit only runs from the initrd with
-    ConditionSecurity=measured-os, so a kvikuki UKI boot gets the measurement
+    ConditionSecurity=measured-os, so a luksury UKI boot gets the measurement
     unless the command line explicitly disables it.
     """
     if not systemd_has_os_separator():
@@ -3522,7 +3522,7 @@ def current_boot_os_separator(algorithm: str = "sha256") -> bool:
     raise UkiError(
         "PCR13 is neither zero nor the systemd os-separator value; a sysext "
         "or confext appears to be active, so the next boot's PCR13 cannot be "
-        "predicted. Boot the kvikuki UKI without extensions before enrolling"
+        "predicted. Boot the luksury UKI without extensions before enrolling"
     )
 
 
@@ -3638,7 +3638,7 @@ def update_crypttab_tpm2(
 ) -> bool:
     """Ensure the root entry auto-unlocks and measures into PCR 15.
 
-    With ``remove``, strip the TPM2 options added by kvikuki instead.
+    With ``remove``, strip the TPM2 options added by luksury instead.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -3706,7 +3706,7 @@ def update_crypttab_tpm2(
     except OSError as exc:
         warn(f"cannot back up {path} to {backup}: {exc}")
 
-    temporary = path.with_name(f".{path.name}.kvikuki.tmp")
+    temporary = path.with_name(f".{path.name}.luksury.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
             handle.write("".join(lines))
@@ -4451,7 +4451,7 @@ def planned_sizes(
     if len(initrds) != 1:
         raise UkiError(
             f"expected exactly one initrd, got {len(initrds)}; "
-            "kvikuki requires a dracut single-initrd entry"
+            "luksury requires a dracut single-initrd entry"
         )
     sizes.append((".initrd", os.path.getsize(initrds[0])))
     return sizes
@@ -4486,7 +4486,7 @@ def build_uki(
     if len(initrds) != 1:
         raise UkiError(
             f"expected exactly one initrd, got {len(initrds)}; "
-            "kvikuki requires a dracut single-initrd entry"
+            "luksury requires a dracut single-initrd entry"
         )
     initrd_path = Path(initrds[0])
 
@@ -4502,7 +4502,7 @@ def build_uki(
     sizes = [(name, path.stat().st_size) for name, path in sections]
     vmas = compute_vmas(info, sizes)
 
-    output = workdir / "kvikuki.efi"
+    output = workdir / "luksury.efi"
     command = ["objcopy"]
     for name, path in sections:
         command.extend(
@@ -4638,13 +4638,13 @@ def require_uefi_boot() -> bool:
     if setup:
         raise UkiError(
             "the firmware is in Setup Mode; enroll your platform keys and "
-            "leave Setup Mode before installing kvikuki"
+            "leave Setup Mode before installing luksury"
         )
 
     if efi_boolean("AuditMode"):
         raise UkiError(
             "the firmware is in Secure Boot Audit Mode; enable enforcing "
-            "mode before installing kvikuki"
+            "mode before installing luksury"
         )
 
     if efi_boolean("MokSBStateRT", SHIM_LOCK_GUID):
@@ -5194,7 +5194,7 @@ def resolve_systemd_boot(esp_override: Path | None = None) -> ResolvedBoot:
     if len(initrds) != 1:
         raise UkiError(
             f"default systemd-boot entry {entry.id!r} has {len(initrds)} "
-            "initrds; kvikuki requires a dracut single-initrd entry"
+            "initrds; luksury requires a dracut single-initrd entry"
         )
     roots = _dedupe_roots([esp, boot])
 
@@ -5353,8 +5353,8 @@ def ensure_boot_entry(esp: Path, label: str, loader: str) -> None:
     if legacy:
         ids = ", ".join(f"Boot{entry['id']}" for entry in legacy)
         warn(
-            f"legacy kvikuki boot entries still exist: {ids}; run "
-            "'kvikuki remove' before installing to avoid booting them"
+            f"legacy luksury boot entries still exist: {ids}; run "
+            "'luksury remove' before installing to avoid booting them"
         )
     existing = [
         entry
@@ -5483,7 +5483,7 @@ def check_space(esp: Path, needed: int) -> None:
 
 
 HOOK_SCRIPT = r"""#!/bin/bash -p
-# Installed automatically by kvikuki.py.
+# Installed automatically by luksury.py.
 set -u
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -5492,16 +5492,16 @@ unset BASH_ENV ENV CDPATH GLOBIGNORE IFS \
       LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG \
       PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE \
       PYTHONWARNINGS PYTHONBREAKPOINT \
-      KVIKUKI_BIN KVIKUKI_LOCK_FILE KVIKUKI_HOOK_ACTIVE
+      LUKSURY_BIN LUKSURY_LOCK_FILE LUKSURY_HOOK_ACTIVE
 
-KVIKUKI_BIN=/usr/local/sbin/kvikuki
-LOCK_FILE=/run/kvikuki.lock
+LUKSURY_BIN=/usr/local/sbin/luksury
+LOCK_FILE=/run/luksury.lock
 PYTHON=/usr/bin/python3
 
 log() {
-    printf 'kvikuki-hook: %s\n' "$*" >&2
+    printf 'luksury-hook: %s\n' "$*" >&2
     if command -v logger >/dev/null 2>&1; then
-        logger -t kvikuki-hook -p warning -- "$*" 2>/dev/null || true
+        logger -t luksury-hook -p warning -- "$*" 2>/dev/null || true
     fi
 }
 
@@ -5547,8 +5547,8 @@ set -- "$@" --initrd "$initrd"
 
 log "checking UKI (mode=$mode)"
 
-if [ ! -x "$KVIKUKI_BIN" ]; then
-    skip "$KVIKUKI_BIN not found or not executable"
+if [ ! -x "$LUKSURY_BIN" ]; then
+    skip "$LUKSURY_BIN not found or not executable"
 fi
 if [ ! -x "$PYTHON" ]; then
     skip "python3 not found at $PYTHON"
@@ -5579,14 +5579,14 @@ else
 fi
 if [ "$have_cryptsetup" = "1" ] && [ "$have_systemd_cryptenroll" = "1" ]; then
     :
-elif [ -e /var/lib/kvikuki/tpm2-state.json ]; then
+elif [ -e /var/lib/luksury/tpm2-state.json ]; then
     skip "cryptsetup or systemd-cryptenroll not found but a TPM2 enrollment is recorded"
 else
     log "cryptsetup or systemd-cryptenroll not found; rebuilding without TPM2 enrollment"
     set -- "$@" --no-enroll-tpm2
 fi
 
-if ! "$PYTHON" -I "$KVIKUKI_BIN" "$@"; then
+if ! "$PYTHON" -I "$LUKSURY_BIN" "$@"; then
     log "UKI rebuild failed"
 fi
 exit 0
@@ -5639,7 +5639,7 @@ def install_self() -> None:
 
 
 def install_debian_hooks() -> None:
-    path = INITRAMFS_POST_UPDATE_DIR / "zz-kvikuki"
+    path = INITRAMFS_POST_UPDATE_DIR / "zz-luksury"
     write_system_file(path, DEBIAN_POST_UPDATE_WRAPPER, 0o755)
 
 
@@ -5648,29 +5648,29 @@ def remove_legacy_systemd_units(
 ) -> None:
     """Remove the old path/timer/service units and kernel postinst hook.
 
-    kvikuki now builds the UKI only from the initramfs post-update hook.
+    luksury now builds the UKI only from the initramfs post-update hook.
     Existing installations may still have the old units enabled, so install
     and remove both clean them up.
     """
     units = (
-        "kvikuki-rebuild.path",
-        "kvikuki-rebuild.timer",
-        "kvikuki-rebuild.service",
+        "luksury-rebuild.path",
+        "luksury-rebuild.timer",
+        "luksury-rebuild.service",
     )
     systemctl = shutil.which("systemctl")
     if dry_run:
         if systemctl is not None:
-            log("would disable and stop legacy kvikuki-rebuild units")
+            log("would disable and stop legacy luksury-rebuild units")
             log("would reload the systemd manager configuration")
     elif systemctl is not None and Path("/run/systemd/system").is_dir():
-        for unit in ("kvikuki-rebuild.path", "kvikuki-rebuild.timer"):
+        for unit in ("luksury-rebuild.path", "luksury-rebuild.timer"):
             run([systemctl, "disable", "--now", unit], check=False)
-        run([systemctl, "stop", "kvikuki-rebuild.service"], check=False)
+        run([systemctl, "stop", "luksury-rebuild.service"], check=False)
         run([systemctl, "daemon-reload"], check=False)
 
     try:
         wants_links = sorted(
-            SYSTEMD_UNIT_DIR.glob("*.wants/kvikuki-rebuild.*")
+            SYSTEMD_UNIT_DIR.glob("*.wants/luksury-rebuild.*")
         )
     except OSError:
         wants_links = []
@@ -5682,7 +5682,7 @@ def remove_legacy_systemd_units(
             SYSTEMD_UNIT_DIR / name, dry_run=dry_run, verbose=verbose
         )
     remove_path(
-        KERNEL_POSTINST_DIR / "zzz-kvikuki",
+        KERNEL_POSTINST_DIR / "zzz-luksury",
         dry_run=dry_run,
         verbose=verbose,
     )
@@ -5843,7 +5843,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
         description=(
-            "Bootstrap the kvikuki installation.  The first run requires "
+            "Bootstrap the luksury installation.  The first run requires "
             "UEFI and works with Secure Boot enabled or disabled.  It "
             "creates/reuses a UKI signing key, queues a MOK enrollment only "
             "when Secure Boot is enforcing, installs the update hook, "
@@ -5858,8 +5858,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the MOK enrollment is confirmed in MokManager after a reboot; "
             "when it is disabled, no MOK enrollment is needed and PCR7 is not "
             "bound.  The installer never reboots automatically.  Use "
-            "--dry-run to inspect without changing anything.  Run 'kvikuki "
-            "remove --help' to uninstall the kvikuki artifacts again."
+            "--dry-run to inspect without changing anything.  Run 'luksury "
+            "remove --help' to uninstall the luksury artifacts again."
         ),
     )
     parser.add_argument(
@@ -5936,8 +5936,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "PEM private key used to sign the UKI (default: the kvikuki "
-            "MOK key in /var/lib/kvikuki)"
+            "PEM private key used to sign the UKI (default: the luksury "
+            "MOK key in /var/lib/luksury)"
         ),
     )
     parser.add_argument(
@@ -5946,7 +5946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "PEM signing certificate enrolled in db or MOK (default: the "
-            "kvikuki MOK certificate in /var/lib/kvikuki)"
+            "luksury MOK certificate in /var/lib/luksury)"
         ),
     )
     parser.add_argument(
@@ -5976,7 +5976,7 @@ def remove_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
         description=(
-            "Remove the kvikuki artifacts: the UKI, matching EFI boot "
+            "Remove the luksury artifacts: the UKI, matching EFI boot "
             "entries, the update hook, the installed copy, all systemd-tpm2 "
             "enrollments, the recovery key itself and its token, crypttab "
             "options, install options and state files.  The MOK signing key "
@@ -6003,7 +6003,7 @@ def remove_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "UKI directory relative to the ESP (default: EFI/<ID> from "
-            "/etc/os-release, plus any other kvikuki.efi found)"
+            "/etc/os-release, plus any other luksury.efi found)"
         ),
     )
     parser.add_argument(
@@ -6038,12 +6038,12 @@ def main_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
         description=(
-            "Bootstrap the kvikuki installation and regenerate the initrd; the "
+            "Bootstrap the luksury installation and regenerate the initrd; the "
             "post-update hook builds and signs the UKI.  Or remove the "
-            "kvikuki artifacts again."
+            "luksury artifacts again."
         ),
         epilog=(
-            "Run 'kvikuki install --help' or 'kvikuki remove --help' for "
+            "Run 'luksury install --help' or 'luksury remove --help' for "
             "the options of each command."
         ),
     )
@@ -6107,7 +6107,7 @@ def acquire_build_lock(lock_held: bool = False) -> int | None:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         os.close(fd)
-        raise UkiError("another kvikuki build is already running") from exc
+        raise UkiError("another luksury build is already running") from exc
     return fd
 
 
@@ -6120,7 +6120,7 @@ def main(argv: list[str] | None = None) -> int:
     lock_fd: int | None = None
     try:
         if os.geteuid() != 0:
-            raise UkiError("must be run as root (try: sudo ./kvikuki.py)")
+            raise UkiError("must be run as root (try: sudo ./luksury.py)")
         lock_fd = acquire_build_lock(
             bool(getattr(args, "lock_held", False))
         )
@@ -6165,7 +6165,7 @@ def validate_resolved_boot(boot: ResolvedBoot) -> None:
     if len(boot.initrds) != 1:
         raise UkiError(
             f"default entry {boot.title!r} has {len(boot.initrds)} initrds; "
-            "kvikuki requires a dracut single-initrd entry"
+            "luksury requires a dracut single-initrd entry"
         )
 
     roots = boot.initrd_roots or initrd_roots()
@@ -6207,7 +6207,7 @@ def validate_prepared_boot(boot: ResolvedBoot) -> None:
     if len(boot.initrds) != 1:
         raise UkiError(
             f"default entry {boot.title!r} has {len(boot.initrds)} initrds; "
-            "kvikuki requires a dracut single-initrd entry"
+            "luksury requires a dracut single-initrd entry"
         )
     path = boot.initrds[0]
     if not os.path.isfile(path):
@@ -6486,7 +6486,7 @@ def run_main(
                 "is disabled and the TPM token does not bind PCR7"
             )
 
-    workdir = Path(tempfile.mkdtemp(prefix="kvikuki-"))
+    workdir = Path(tempfile.mkdtemp(prefix="luksury-"))
     try:
         validate_resolved_boot(boot)
         prepared = prepare_resolved_boot(boot, workdir)
@@ -6816,7 +6816,7 @@ def run_main(
 
 
 def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
-    """Bootstrap kvikuki; the post-update hook is the only UKI builder."""
+    """Bootstrap luksury; the post-update hook is the only UKI builder."""
     check_tools(args.no_boot_entry)
     secure_boot = require_uefi_boot()
 
@@ -6840,7 +6840,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
     if not release:
         raise UkiError(
             "cannot determine the default entry's kernel release; "
-            "refusing to regenerate initrds because kvikuki only "
+            "refusing to regenerate initrds because luksury only "
             "regenerates the default entry's initrd"
         )
 
@@ -6856,7 +6856,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
 
     if args.dry_run:
         material = load_signing_material(args)
-        log("would install the kvikuki update hook and options")
+        log("would install the luksury update hook and options")
         log(f"would use kernel: {boot.kernel}")
         for path in boot.initrds:
             log(f"would use initrd: {path}")
@@ -6875,7 +6875,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
                 "MokNew", SHIM_LOCK_GUID
             ):
                 raise UkiError(
-                    "a MOK enrollment is already pending but the kvikuki "
+                    "a MOK enrollment is already pending but the luksury "
                     "signing key/certificate is missing; restore them or run "
                     "'mokutil --revoke-import' before generating a new key"
                 )
@@ -6972,7 +6972,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
                 "rerun with --no-enroll-tpm2"
             ) from exc
 
-    # The post-update hook takes /run/kvikuki.lock itself.  Release our copy
+    # The post-update hook takes /run/luksury.lock itself.  Release our copy
     # before invoking update-initramfs so the hook can run.
     if lock_fd is not None:
         import fcntl
@@ -6994,7 +6994,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
     if not destination.is_file():
         raise UkiError(
             f"the post-update hook did not create {destination}; "
-            "check the journal for kvikuki-hook messages"
+            "check the journal for luksury-hook messages"
         )
     newest = newest_input_mtime(boot, CRYPTTAB)
     try:
@@ -7005,7 +7005,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
     if newest and current + 2_000_000_000 < newest:
         raise UkiError(
             f"{destination} was not updated by the post-update hook; "
-            "check the journal for kvikuki-hook messages"
+            "check the journal for luksury-hook messages"
         )
 
     ensure_shim_loader(esp, efi_dir, shim, mmx)
@@ -7034,7 +7034,7 @@ def run_install(args: argparse.Namespace, lock_fd: int | None = None) -> int:
             if not tokens:
                 warn(
                     "the post-update hook did not create a systemd-tpm2 "
-                    "token; check the journal for kvikuki-hook messages"
+                    "token; check the journal for luksury-hook messages"
                 )
             else:
                 verify_tpm2_token(
@@ -7588,7 +7588,7 @@ def remove_update_hooks(*, dry_run: bool, verbose: bool = False) -> None:
     """Remove the post-update hook and any legacy update units."""
     remove_legacy_systemd_units(dry_run=dry_run, verbose=verbose)
     remove_path(
-        INITRAMFS_POST_UPDATE_DIR / "zz-kvikuki",
+        INITRAMFS_POST_UPDATE_DIR / "zz-luksury",
         dry_run=dry_run,
         verbose=verbose,
     )
@@ -7615,9 +7615,9 @@ def resolve_removal_esp(args: argparse.Namespace) -> tuple[Path, str]:
 
 
 def find_uki_files(esp: Path, efi_dir: Path) -> list[Path]:
-    """Return the current kvikuki UKI.
+    """Return the current luksury UKI.
 
-    Legacy ``kvikuki.efi`` files are deliberately ignored: the old layout is
+    Legacy ``luksury.efi`` files are deliberately ignored: the old layout is
     not part of the current installation and ``remove`` must not touch it.
     """
     try:
@@ -7660,7 +7660,7 @@ def remove_efi_boot_entries(
     ]
     if not matches:
         if verbose:
-            log("no kvikuki EFI boot entries found")
+            log("no luksury EFI boot entries found")
         return True
 
     success = True
@@ -7763,7 +7763,7 @@ def run_remove(args: argparse.Namespace) -> int:
     # before anything is changed so a lockout cannot be half-applied.
     luks_plan = plan_luks_removal(args)
 
-    log(f"removing kvikuki artifacts from {esp}")
+    log(f"removing luksury artifacts from {esp}")
     revoke_pending_mok_request(dry_run=dry_run)
     remove_update_hooks(dry_run=dry_run, verbose=verbose)
     efi_ok = remove_efi_boot_entries(
@@ -7836,7 +7836,7 @@ def run_remove(args: argparse.Namespace) -> int:
     # Remove the old allow-list file from installations that predate the
     # switch to building from the just-generated initrd.
     remove_path(
-        Path("/var/lib/kvikuki/initrd-hashes.json"),
+        Path("/var/lib/luksury/initrd-hashes.json"),
         dry_run=dry_run,
         verbose=verbose,
     )
@@ -7873,7 +7873,7 @@ def run_remove(args: argparse.Namespace) -> int:
             f"left the MOK signing key {MOK_KEY_FILE} and its enrollment in "
             "place; use 'mokutil --delete' to remove the certificate"
         )
-    log("removed the kvikuki installation")
+    log("removed the luksury installation")
     return 0
 
 
