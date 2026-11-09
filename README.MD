@@ -5,11 +5,17 @@ entry of an Ubuntu system with a LUKS2-encrypted root, and binds the volume
 unlock to the TPM2 (Secure Boot optional, GRUB or systemd-boot).
 Automatically updates the PCR to predicted values on system updates.
 
+# Alpha phase
+
+Bugs,vulnerabilities reports are welcome.
+
 ## Requirements
 
 * Ubuntu **25.04 or newer** (x86-64), UEFI boot, TPM 2.0, LUKS2 root activated
   via `/etc/crypttab`, dpkg-managed Ubuntu kernel, `python3` ≥ 3.9.
 * A **dracut-based initrd**
+
+## Installation:
 
 ## Step 1 — Switch to Dracut, if you are using initramfs-tools (Hello Kubuntu)
 
@@ -27,8 +33,7 @@ Reboot once and confirm the system still boots.
 ## Step 2 — Install the dependencies
 
 ```console
-$ sudo apt install dracut binutils sbsigntool openssl efibootmgr mokutil \
-                     shim-signed systemd-boot-efi tpm2-tools cryptsetup python3
+$ sudo apt install dracut binutils sbsigntool openssl efibootmgr mokutil shim-signed systemd-boot-efi tpm2-tools cryptsetup python3
 ```
 If `apt` cannot find `systemd-boot-efi`, enable universe first:
 `sudo add-apt-repository universe && sudo apt update`.
@@ -61,7 +66,7 @@ enforcing):
 | 13 | Other boot components (Fat binaries) | the systemd os-separator value; zero only when the separator does not run (sysext/confext unsupported) |
 | 15 | OS vendor specific | zero: systemd-cryptsetup measures the LUKS volume key into PCR 15 only after the token has been unsealed, so it can't be unsealed a second time |
 
-Falls back to password prompt on PCR mismatch. Change in the system, BIOS, or secure boot DBX update may cause it.
+Falls back to password prompt on PCR mismatch. Change in hardware, BIOS, or secure boot DBX update may cause it.
 
 ## Uninstall
 
